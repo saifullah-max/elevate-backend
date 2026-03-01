@@ -4,6 +4,7 @@ import prisma from './dbConnection';
 import { supabaseStorage } from './services/supabaseStorage.service';
 import { startCleanupCron } from './cron/cleanupExpiredInvitations';
 import { processPendingPurchases } from './services/payment.service';
+
 dotenv.config();
 
 const PORT = process.env.PORT || 3003;
