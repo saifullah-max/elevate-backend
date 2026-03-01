@@ -40,6 +40,25 @@ function getDeviceTypeFromUserAgent(userAgent: string | string[] | undefined): s
   return "desktop";
 }
 
+function toPublicImageUrl(rawPath: string, req: Request): string {
+  if (!rawPath) return rawPath;
+  if (/^https?:\/\//i.test(rawPath)) return rawPath;
+
+  const normalized = rawPath.replace(/\\/g, "/");
+  const uploadsMatch = normalized.match(/(?:^|\/)(uploads\/.+)$/i);
+  if (uploadsMatch) {
+    const host = req.get("host") || "localhost:3003";
+    return `${req.protocol}://${host}/${uploadsMatch[1]}`;
+  }
+
+  if (normalized.startsWith("/")) {
+    const host = req.get("host") || "localhost:3003";
+    return `${req.protocol}://${host}${normalized}`;
+  }
+
+  return rawPath;
+}
+
 /**
  * Restage a previously staged image with a new prompt (variation/edit)
  * Accepts a staged image file and prompt, returns a new staged image
@@ -302,7 +321,8 @@ export async function getRecentUploads(req: Request, res: Response): Promise<voi
 
     const userId = req.user.id;
     const { limit = 10 } = req.query;
-    const maxLimit = Math.min(Number(limit), 50); // Cap at 50
+    const maxLimit = Math.min(Number(limit), 50); // Cap at 50 groups
+    const rawLimit = Math.min(maxLimit * 8, 400);
 
     // Fetch user's images from database
     const userImages = await prisma.image.findMany({
@@ -312,40 +332,74 @@ export async function getRecentUploads(req: Request, res: Response): Promise<voi
       orderBy: {
         created_at: "desc",
       },
-      take: maxLimit,
+      take: rawLimit,
     });
 
-    // Build response with image URLs
-    const uploads = userImages.map((img) => {
-      const originalUrl = img.original_image_url;
-      const stagedUrl = img.staged_image_url || null;
+    const grouped = new Map<string, any>();
 
-      // Extract original filename from URL if needed
+    for (const img of userImages) {
+      const originalUrl = toPublicImageUrl(img.original_image_url, req);
+      const key = originalUrl;
       const originalFilename = originalUrl.split("/").pop() || "original";
-      const stagedFilename = stagedUrl ? stagedUrl.split("/").pop() || "staged" : null;
 
-      return {
-        original: {
-          filename: originalFilename,
-          url: originalUrl,
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          groupId: `${img.user_id || "user"}:${originalUrl}`,
+          original: {
+            filename: originalFilename,
+            url: originalUrl,
+            createdAt: img.created_at.toISOString(),
+            status: img.status,
+          },
+          staged: null,
+          stagedVariants: [],
           createdAt: img.created_at.toISOString(),
-        },
-        staged: stagedUrl
-          ? {
-              filename: stagedFilename,
-              url: stagedUrl,
-              createdAt: img.updated_at.toISOString(),
-            }
-          : null,
-        createdAt: img.created_at.toISOString(),
-      };
-    });
+          statusSummary: {
+            processing: 0,
+            completed: 0,
+            failed: 0,
+          },
+        });
+      }
+
+      const group = grouped.get(key);
+      if (img.created_at < new Date(group.createdAt)) {
+        group.createdAt = img.created_at.toISOString();
+      }
+
+      if (img.status === image_status.PROCESSING) group.statusSummary.processing += 1;
+      if (img.status === image_status.COMPLETED) group.statusSummary.completed += 1;
+      if (img.status === image_status.FAILED) group.statusSummary.failed += 1;
+
+      if (img.staged_image_url) {
+        const stagedUrl = toPublicImageUrl(img.staged_image_url, req);
+        const stagedFilename = stagedUrl.split("/").pop() || "staged";
+        group.stagedVariants.push({
+          id: img.id,
+          filename: stagedFilename,
+          url: stagedUrl,
+          createdAt: img.updated_at.toISOString(),
+          status: img.status,
+        });
+      }
+    }
+
+    const uploads = Array.from(grouped.values())
+      .map((group: any) => {
+        group.stagedVariants.sort((a: any, b: any) =>
+          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+        );
+        group.staged = group.stagedVariants[0] || null;
+        return group;
+      })
+      .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .slice(0, maxLimit);
 
     res.status(200).json({
       success: true,
       data: {
         uploads,
-        total: userImages.length,
+        total: uploads.length,
         limit: maxLimit,
         storage: "database",
       },
@@ -931,42 +985,301 @@ export async function generateMultipleImages(
     return;
   }
 
+  const VARIATIONS_PER_IMAGE = 5;
+  const wantsStream =
+    req.query.stream === "1" ||
+    (typeof req.headers.accept === "string" && req.headers.accept.includes("text/event-stream"));
+
   const userId = req.user.id;
-  const { roomType, stagingStyle, prompt } = req.body;
+  const { roomType = "living-room", stagingStyle = "modern", prompt } = req.body;
+  let teamId: string | null = req.body.teamId || null;
+  let projectId: string | null = req.body.projectId || null;
 
   const files = req.files as Express.Multer.File[];
+  const creditsRequired = files.length;
 
-  // Create DB records
-  const images = await prisma.$transaction(
-    files.map((file) =>
-      prisma.image.create({
-        data: {
-          user_id: userId,
-          original_image_url: file.path,
-          status: image_status.PROCESSING,
-        },
+  if (!creditsRequired) {
+    res.status(400).json({
+      success: false,
+      error: {
+        code: ImageErrorCode.NO_FILE_PROVIDED,
+        message: ErrorMessages[ImageErrorCode.NO_FILE_PROVIDED],
+      },
+    });
+    return;
+  }
+
+  if (!teamId || typeof teamId !== "string" || teamId.trim() === "" || teamId === "undefined" || teamId === "null") {
+    teamId = null;
+  }
+
+  if (!projectId || typeof projectId !== "string" || projectId.trim() === "" || projectId === "undefined" || projectId === "null") {
+    projectId = null;
+  }
+
+  let originalsWithUrls: Array<{ file: Express.Multer.File; originalUrl: string }> = [];
+  try {
+    originalsWithUrls = await Promise.all(
+      files.map(async (file) => {
+        const originalUrl = await supabaseStorage.uploadOriginal(file.path);
+        return { file, originalUrl };
       })
-    )
-  );
+    );
+  } catch (uploadError) {
+    res.status(500).json({
+      success: false,
+      error: {
+        code: ImageErrorCode.STORAGE_UPLOAD_FAILED,
+        message: "Failed to upload original images for multi-stage request.",
+        details: uploadError instanceof Error ? uploadError.message : undefined,
+      },
+    });
+    return;
+  }
+
+  let teamMembership: any = null;
+  let isTeamOwner = false;
+
+  if (teamId) {
+    const team = await prisma.teams.findFirst({
+      where: {
+        id: teamId,
+        owner_id: userId,
+        deleted_at: null,
+      },
+    });
+
+    if (team) {
+      isTeamOwner = true;
+      if (Number(team.wallet) < creditsRequired) {
+        res.status(403).json({
+          success: false,
+          error: {
+            code: "INSUFFICIENT_CREDITS",
+            message: `Team has insufficient credits. Staging ${creditsRequired} images requires ${creditsRequired} credits.`,
+          },
+        });
+        return;
+      }
+    } else {
+      teamMembership = await prisma.team_membership.findUnique({
+        where: {
+          team_id_user_id: {
+            team_id: teamId,
+            user_id: userId,
+          },
+        },
+        include: {
+          team: true,
+        },
+      });
+
+      if (!teamMembership || teamMembership.team.deleted_at) {
+        res.status(403).json({
+          success: false,
+          error: {
+            code: "TEAM_ACCESS_DENIED",
+            message: "You do not have access to this team.",
+          },
+        });
+        return;
+      }
+
+      const remainingCredits = Number(teamMembership.allocated) - Number(teamMembership.used);
+      if (remainingCredits < creditsRequired) {
+        res.status(403).json({
+          success: false,
+          error: {
+            code: "INSUFFICIENT_CREDITS",
+            message: `You have ${remainingCredits} remaining team credits, but staging ${creditsRequired} images requires ${creditsRequired} credits.`,
+          },
+        });
+        return;
+      }
+    }
+  } else {
+    const personalCredits = await prisma.user_credit_balance.findUnique({
+      where: { user_id: userId },
+    });
+    const personalBalance = Number(personalCredits?.balance || 0);
+    if (personalBalance < creditsRequired) {
+      res.status(403).json({
+        success: false,
+        error: {
+          code: "INSUFFICIENT_CREDITS",
+          message: `You have ${personalBalance} personal credits, but staging ${creditsRequired} images requires ${creditsRequired} credits.`,
+        },
+      });
+      return;
+    }
+  }
+
+  // Create DB records and deduct credits atomically
+  const images = await prisma.$transaction(async (tx) => {
+    const createdImages = await Promise.all(
+      originalsWithUrls.map(({ originalUrl }) =>
+        tx.image.create({
+          data: {
+            user_id: userId,
+            project_id: projectId,
+            original_image_url: originalUrl,
+            status: image_status.PROCESSING,
+            room_type: roomType,
+            staging_style: stagingStyle,
+            prompt: prompt || null,
+            source: "user",
+            is_demo: false,
+          },
+        })
+      )
+    );
+
+    if (teamId) {
+      if (isTeamOwner) {
+        await tx.teams.update({
+          where: { id: teamId },
+          data: { wallet: { decrement: creditsRequired } },
+        });
+      } else if (teamMembership) {
+        await tx.team_membership.update({
+          where: { id: teamMembership.id },
+          data: { used: { increment: creditsRequired } },
+        });
+
+        if (createdImages.length > 0) {
+          await tx.team_usage.createMany({
+            data: createdImages.map((image) => ({
+              membership_id: teamMembership.id,
+              image_id: image.id,
+              credits_used: 1,
+              teamsId: teamId as string,
+            })),
+          });
+        }
+      }
+    } else {
+      await tx.user_credit_balance.update({
+        where: { user_id: userId },
+        data: { balance: { decrement: creditsRequired } },
+      });
+    }
+
+    return createdImages;
+  });
 
   // Push jobs to queue
-  images.forEach((image) => {
+  images.forEach((image, index) => {
     imageQueue.add({
       imageId: image.id,
-      originalPath: image.original_image_url,
+      originalPath: originalsWithUrls[index].file.path,
       roomType,
       stagingStyle,
       customPrompt: prompt,
     });
   });
 
-  // Respond immediately
-  res.status(202).json({
-    success: true,
-    message: "Images uploaded successfully. Staging started.",
-    data: {
-      total: images.length,
+  if (!wantsStream) {
+    res.status(202).json({
+      success: true,
+      message: "Images uploaded successfully. Staging started.",
+      data: {
+        total: images.length,
+        imageIds: images.map((img) => img.id),
+        creditsUsed: creditsRequired,
+        creditScope: teamId ? "team" : "personal",
+      },
+    });
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders && res.flushHeaders();
+
+  const originalUrls = images.map((img) => img.original_image_url);
+  const sentImageIds = new Set<string>();
+
+  res.write(
+    `event: accepted\ndata: ${JSON.stringify({
+      totalImages: images.length,
+      expectedVariantsPerImage: VARIATIONS_PER_IMAGE,
+      creditsUsed: creditsRequired,
       imageIds: images.map((img) => img.id),
-    },
+    })}\n\n`
+  );
+
+  const interval = setInterval(async () => {
+    try {
+      const rows = await prisma.image.findMany({
+        where: {
+          user_id: userId,
+          original_image_url: { in: originalUrls },
+        },
+        orderBy: { created_at: "asc" },
+      });
+
+      const byOriginal = new Map<string, typeof rows>();
+      for (const row of rows) {
+        const list = byOriginal.get(row.original_image_url) || [];
+        list.push(row);
+        byOriginal.set(row.original_image_url, list);
+      }
+
+      for (let originalIndex = 0; originalIndex < originalUrls.length; originalIndex++) {
+        const originalUrl = originalUrls[originalIndex];
+        const list = (byOriginal.get(originalUrl) || []).sort(
+          (a, b) => a.created_at.getTime() - b.created_at.getTime()
+        );
+
+        const completedRows = list.filter(
+          (row) => row.status === image_status.COMPLETED && Boolean(row.staged_image_url)
+        );
+
+        for (const [variationIndex, row] of completedRows.entries()) {
+          if (!sentImageIds.has(row.id)) {
+            sentImageIds.add(row.id);
+            const stagedImageUrl = row.staged_image_url as string;
+            const stagedId = stagedImageUrl.split("/").pop() || row.id;
+
+            res.write(
+              `event: image\ndata: ${JSON.stringify({
+                imageId: row.id,
+                originalIndex,
+                variationIndex,
+                stagedImageUrl,
+                stagedId,
+                roomType,
+                stagingStyle,
+                prompt: prompt || null,
+                storage: "supabase",
+              })}\n\n`
+            );
+          }
+        }
+      }
+
+      const baseRows = rows.filter((row) => images.some((img) => img.id === row.id));
+      const hasProcessingBase = baseRows.some((row) => row.status === image_status.PROCESSING);
+
+      if (!hasProcessingBase) {
+        clearInterval(interval);
+        res.write(`event: done\ndata: ${JSON.stringify({ totalStreamed: sentImageIds.size })}\n\n`);
+        res.end();
+      }
+    } catch (streamErr) {
+      clearInterval(interval);
+      res.write(
+        `event: error\ndata: ${JSON.stringify({
+          message: "Failed while streaming multi-image progress",
+          details: streamErr instanceof Error ? streamErr.message : String(streamErr),
+        })}\n\n`
+      );
+      res.end();
+    }
+  }, 1500);
+
+  req.on("close", () => {
+    clearInterval(interval);
   });
 }
