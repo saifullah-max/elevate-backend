@@ -1,6 +1,5 @@
 node_modules
 # Keep environment variables out of version control
-.env
 .env.prod
 
 /generated/prisma
@@ -17,3 +16,4 @@ DATABASE_SCHEMA_FLOW.md
 EMAIL_FIX_GUIDE.md
 
 dist/
+config.bat
