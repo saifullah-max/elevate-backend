@@ -13,31 +13,37 @@ if (jwtSecret) {
   passport.use(
     new JWTStrategy(
       {
-        jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+        jwtFromRequest: (req) => {
+          const authHeader = req.headers.authorization;
+          logger(`[JWT Extract] Auth header: ${authHeader ? authHeader.substring(0, 50) + '...' : 'none'}`);
+          const token = ExtractJwt.fromAuthHeaderAsBearerToken()(req);
+          logger(`[JWT Extract] Extracted token: ${token ? token.substring(0, 20) + '...' : 'failed'}`);
+          return token;
+        },
         secretOrKey: jwtSecret,
       },
       async (jwtPayload: any, done: (error: any, user?: any) => void) => {
         try {
-          logger(`JWT Strategy: Received JWT with payload: ${JSON.stringify(jwtPayload)}`);
+          logger(`[JWT Strategy] Callback invoked with payload: ${JSON.stringify(jwtPayload)}`);
           
-          // The JWT payload contains the user information (use userId, not id)
+          // The JWT payload contains the user information (use userId or id)
           const user = {
             id: jwtPayload.userId || jwtPayload.id,
             role: jwtPayload.role,
           };
 
-          logger(`JWT Strategy: User authenticated successfully. userId=${user.id}, role=${user.role}`);
+          logger(`[JWT Strategy] User authenticated successfully. userId=${user.id}, role=${user.role}`);
           return done(null, user);
         } catch (error) {
-          logger(`JWT Strategy error: ${error instanceof Error ? error.message : String(error)}`);
+          logger(`[JWT Strategy] Error: ${error instanceof Error ? error.message : String(error)}`);
           return done(error as Error);
         }
       }
     )
   );
-  logger("JWT strategy configured");
+  logger("[Passport] JWT strategy configured with secret length: " + jwtSecret.length);
 } else {
-  logger("JWT not configured (missing JWT_SECRET)");
+  logger("[Passport] JWT not configured (missing JWT_SECRET)");
 }
 
 // GOOGLE STRATEGY

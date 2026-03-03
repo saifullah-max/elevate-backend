@@ -1,6 +1,5 @@
 node_modules
 # Keep environment variables out of version control
-.env
 .env.prod
 
 /generated/prisma
@@ -19,3 +18,4 @@ EMAIL_FIX_GUIDE.md
 dist/
 logs/
 MONGODB_LOGGING.md
+config.bat
