@@ -20,13 +20,13 @@ if (jwtSecret) {
         try {
           logger(`JWT Strategy: Received JWT with payload: ${JSON.stringify(jwtPayload)}`);
           
-          // The JWT payload contains the user information
+          // The JWT payload contains the user information (use userId, not id)
           const user = {
-            id: jwtPayload.id,
+            id: jwtPayload.userId || jwtPayload.id,
             role: jwtPayload.role,
           };
 
-          logger(`JWT Strategy: User authenticated successfully. userId=${user.id}`);
+          logger(`JWT Strategy: User authenticated successfully. userId=${user.id}, role=${user.role}`);
           return done(null, user);
         } catch (error) {
           logger(`JWT Strategy error: ${error instanceof Error ? error.message : String(error)}`);
