@@ -45,51 +45,44 @@ export async function processBatchImage(job: BatchStageJob): Promise<void> {
             data: { status: ImageStatus.PROCESSING },
         });
 
-        const variationTasks = Array.from({ length: VARIATIONS_PER_IMAGE }).map(async (_, variationIndex) => {
-            const variationPrompt = customPrompt ? `${customPrompt} [variation ${variationIndex + 1}]` : undefined;
+        let generatedVariations: Buffer[] = [];
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_VARIATION; attempt++) {
+            try {
+                generatedVariations = await geminiService.stageImageVariations(
+                    originalPath,
+                    roomType,
+                    stagingStyle,
+                    VARIATIONS_PER_IMAGE,
+                    customPrompt
+                );
+                break;
+            } catch (attemptError) {
+                if (isQuotaExhaustedError(attemptError)) {
+                    logger(`[JOB][${imageId.slice(0, 8)}] QUOTA EXHAUSTED`);
+                    break;
+                }
 
-            for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_VARIATION; attempt++) {
-                try {
-                    const stagedImageBuffer = await geminiService.stageImage(
-                        originalPath,
-                        roomType,
-                        stagingStyle,
-                        variationPrompt
-                    );
-
-                    const stagedFileName = `staged-${Date.now()}-${imageId}-${variationIndex}-${attempt}.png`;
-                    const stagedUrl = await supabaseStorage.uploadStagedFromBuffer(
-                        stagedImageBuffer,
-                        stagedFileName,
-                        "image/png"
-                    );
-
-                    return {
-                        variationIndex,
-                        stagedUrl,
-                    };
-                } catch (attemptError) {
-                    const errorStr = String(attemptError);
-                    if (isQuotaExhaustedError(attemptError)) {
-                        logger(
-                            `[JOB][${imageId.slice(0, 8)}] Variation ${variationIndex + 1}: QUOTA EXHAUSTED`
-                        );
-                        break;
-                    }
-
-                    if (attempt < MAX_ATTEMPTS_PER_VARIATION) {
-                        await delay(RETRY_BACKOFF_BASE_MS * attempt);
-                    }
+                if (attempt < MAX_ATTEMPTS_PER_VARIATION) {
+                    await delay(RETRY_BACKOFF_BASE_MS * attempt);
                 }
             }
+        }
 
-            return null;
-        });
+        const successfulVariants = await Promise.all(
+            generatedVariations.map(async (stagedImageBuffer, variationIndex) => {
+                const stagedFileName = `staged-${Date.now()}-${imageId}-${variationIndex}.png`;
+                const stagedUrl = await supabaseStorage.uploadStagedFromBuffer(
+                    stagedImageBuffer,
+                    stagedFileName,
+                    "image/png"
+                );
 
-        const results = await Promise.all(variationTasks);
-        const successfulVariants = results
-            .filter((result): result is { variationIndex: number; stagedUrl: string } => Boolean(result?.stagedUrl))
-            .sort((a, b) => a.variationIndex - b.variationIndex);
+                return {
+                    variationIndex,
+                    stagedUrl,
+                };
+            })
+        );
 
         const completedCount = successfulVariants.length;
 

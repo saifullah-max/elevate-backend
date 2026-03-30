@@ -42,6 +42,25 @@ class OAuthService {
     success: boolean;
     isNewUser: boolean;
   }> {
+    return this.authenticateOAuthUserWithOptions(profile, { allowCreate: true });
+  }
+
+  async authenticateOAuthUserWithOptions(
+    profile: OAuthUserProfile,
+    options: { allowCreate: boolean; disallowReason?: "SIGN_IN_ONLY" | "AGREEMENTS_REQUIRED" }
+  ): Promise<{
+    token: string;
+    user: {
+      id: string;
+      email: string;
+      name: string | null;
+      role: string[];
+      avatarUrl: string | null;
+      authProvider: string;
+    };
+    success: boolean;
+    isNewUser: boolean;
+  }> {
     const { providerId, provider, email, name, avatarUrl } = profile;
     const providerIdField = providerIdFields[provider];
     const authProviderValue = providerEnumValues[provider];
@@ -61,6 +80,18 @@ class OAuthService {
         user = await this.linkProviderToUser(user.id, provider, providerId, avatarUrl);
         logger(`Linked ${provider} account to existing user: ${user.id}`);
       } else {
+        if (!options.allowCreate) {
+          const error: any = new Error(
+            options.disallowReason === "AGREEMENTS_REQUIRED"
+              ? "You must accept required registration agreements before signing up with Google."
+              : "No account found. Please sign up first."
+          );
+          error.code = options.disallowReason === "AGREEMENTS_REQUIRED"
+            ? "OAUTH_AGREEMENTS_REQUIRED"
+            : "OAUTH_ACCOUNT_NOT_FOUND";
+          throw error;
+        }
+
         // Step 3: Create new user
         user = await this.createOAuthUser(profile);
         isNewUser = true;

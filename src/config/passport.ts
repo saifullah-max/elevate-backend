@@ -7,6 +7,62 @@ import { oauthService } from "../services/oauth.service";
 import { getOAuthConfig, OAuthUserProfile } from "./oauth.config";
 import { logger } from "../utils/logger";
 
+const parseOAuthState = (rawState: unknown): { intent: "signin" | "signup"; agreementsAccepted: boolean } | null => {
+  if (typeof rawState !== "string" || !rawState) {
+    return null;
+  }
+
+  const simpleParts = rawState.split(".");
+  if (simpleParts.length >= 2) {
+    const intent = simpleParts[0] === "signup" ? "signup" : simpleParts[0] === "signin" ? "signin" : null;
+    const agreementsAccepted = simpleParts[1] === "1" ? true : simpleParts[1] === "0" ? false : null;
+
+    if (intent && agreementsAccepted !== null) {
+      return { intent, agreementsAccepted };
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(decodeURIComponent(rawState));
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const intent = (parsed as any).intent === "signup" ? "signup" : "signin";
+    const agreementsAccepted = (parsed as any).agreementsAccepted === true;
+    return { intent, agreementsAccepted };
+  } catch {
+    try {
+      const parsed = JSON.parse(Buffer.from(rawState, "base64url").toString("utf8"));
+      if (!parsed || typeof parsed !== "object") {
+        return null;
+      }
+
+      const intent = (parsed as any).intent === "signup" ? "signup" : "signin";
+      const agreementsAccepted = (parsed as any).agreementsAccepted === true;
+      return { intent, agreementsAccepted };
+    } catch {
+      return null;
+    }
+  }
+};
+
+const getCookieFromHeader = (rawCookieHeader: unknown, name: string): string | null => {
+  if (typeof rawCookieHeader !== "string" || !rawCookieHeader) {
+    return null;
+  }
+
+  const pairs = rawCookieHeader.split(";");
+  for (const pair of pairs) {
+    const [key, ...valueParts] = pair.trim().split("=");
+    if (key === name) {
+      return decodeURIComponent(valueParts.join("="));
+    }
+  }
+
+  return null;
+};
+
 // JWT STRATEGY
 const jwtSecret = process.env.JWT_SECRET;
 if (jwtSecret) {
@@ -56,18 +112,42 @@ if (googleConfig) {
         clientSecret: googleConfig.clientSecret,
         callbackURL: googleConfig.callbackURL,
         scope: googleConfig.scope,
+        passReqToCallback: true,
       },
-      async (accessToken, refreshToken, profile, done) => {
+      async (req, accessToken, refreshToken, profile, done) => {
         try {
           logger(`Google OAuth strategy: Received profile for email=${profile.emails?.[0]?.value}, id=${profile.id}`);
+
+          const statePayload = parseOAuthState(req.query.state);
+          const cookieIntent = getCookieFromHeader(req.headers.cookie, "oauth_intent");
+          const cookieAgreementsAccepted = getCookieFromHeader(req.headers.cookie, "oauth_agreements_accepted") === "true";
+          const intentFromQuery =
+            req.query.intent === "signup" || req.query.signupIntent === "true"
+              ? "signup"
+              : req.query.intent === "signin"
+                ? "signin"
+                : null;
+          const oauthIntent = intentFromQuery || statePayload?.intent || (cookieIntent === "signup" ? "signup" : "signin");
+          const agreementsFromQuery = req.query.agreementsAccepted === "true" || req.query.agreementsAccepted === "1";
+          const agreementsAccepted =
+            agreementsFromQuery || statePayload?.agreementsAccepted || cookieAgreementsAccepted;
+
+          const allowCreate = oauthIntent === "signup" && agreementsAccepted;
+          const disallowReason = oauthIntent === "signup" ? "AGREEMENTS_REQUIRED" : "SIGN_IN_ONLY";
           
-          const result = await oauthService.authenticateOAuthUser({
-            provider: "google",
-            providerId: profile.id,
-            email: profile.emails?.[0]?.value || profile.id + "@example.com",
-            name: profile.displayName || "",
-            avatarUrl: profile.photos?.[0]?.value || null,
-          });
+          const result = await oauthService.authenticateOAuthUserWithOptions(
+            {
+              provider: "google",
+              providerId: profile.id,
+              email: profile.emails?.[0]?.value || profile.id + "@example.com",
+              name: profile.displayName || "",
+              avatarUrl: profile.photos?.[0]?.value || null,
+            },
+            {
+              allowCreate,
+              disallowReason,
+            }
+          );
 
           logger(`Google OAuth strategy: User authenticated successfully. userId=${result.user.id}, isNewUser=${result.isNewUser}`);
 

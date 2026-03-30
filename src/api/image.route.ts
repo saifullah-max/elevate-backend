@@ -11,11 +11,11 @@ router.get("/recent", requireAuth, getRecentUploads);
 // Generate/stage an image using AI
 router.post("/generate", optionalAuth, uploadImage, generateImage);
 // Restage a previously staged image (variation/edit)
-router.post("/restage", uploadImage, restageImage);
+router.post("/restage", optionalAuth, uploadImage, restageImage);
 
 // Analyze an image to get room type and suggestions
 router.post("/analyze", uploadImage, analyzeImage);
 
-router.post("/multiple-generate", requireAuth ,uploadImages(30), generateMultipleImages);
+router.post("/multiple-generate", requireAuth ,uploadImages(15), generateMultipleImages);
 
 export default router;

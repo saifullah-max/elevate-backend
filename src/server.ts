@@ -4,6 +4,7 @@ import prisma from './dbConnection';
 import { mongoDb } from './config/mongodb.config';
 import { supabaseStorage } from './services/supabaseStorage.service';
 import { startCleanupCron } from './cron/cleanupExpiredInvitations';
+import processSubscriptionRenewals from './cron/processSubscriptionRenewals';
 import { processPendingPurchases } from './services/payment.service';
 dotenv.config();
 
@@ -48,6 +49,28 @@ app.listen(PORT, async () => {
 
   // Start cron job for cleaning up expired invitations
   startCleanupCron();
+
+  // Start cron job for processing subscription renewals (daily at 1 AM UTC)
+  try {
+    await processSubscriptionRenewals();
+    console.log('Initial subscription renewal processing completed');
+  } catch (err) {
+    console.error('Failed to process subscription renewals on startup:', err);
+  }
+
+  // Schedule subscription renewal processing daily at 1 AM UTC
+  // // Using 24 hours interval for simplicity (runs approximately at same time daily)
+  // setInterval(() => {
+  //   processSubscriptionRenewals().catch(err => {
+  //     console.error('Scheduled subscription renewal processing failed:', err);
+  //   });
+  // }, 24 * 60 * 60 * 1000); // 24 hours
+
+  setInterval(() => {
+    processSubscriptionRenewals().catch(err => {
+      console.error('Scheduled subscription renewal processing failed:', err);
+    });
+  }, 1 * 60 * 1000); // 1 minute
 
   // Process pending purchases on startup
   try {

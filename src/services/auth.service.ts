@@ -113,3 +113,81 @@ export async function loginService({ email, password }: { email: string; passwor
     success: true,
   };
 }
+
+export async function updateProfileImageService({
+  userId,
+  avatarUrl,
+}: {
+  userId: string;
+  avatarUrl: string;
+}) {
+  const existingUser = await prisma.user.findUnique({
+    where: { id: userId },
+  });
+
+  if (!existingUser) {
+    const err: any = new Error("User not found");
+    err.code = "USER_NOT_FOUND";
+    throw err;
+  }
+
+  const updatedUser = await prisma.user.update({
+    where: { id: userId },
+    data: {
+      avatar_url: avatarUrl,
+    },
+  });
+
+  const userRole = await prisma.user_roles.findFirst({
+    where: { user_id: userId },
+    include: { role: true },
+  });
+
+  return {
+    success: true,
+    message: "Profile image updated successfully",
+    user: {
+      id: updatedUser.id,
+      email: updatedUser.email,
+      name: updatedUser.name,
+      role: userRole?.role.name || "USER",
+      avatar_url: updatedUser.avatar_url,
+    },
+  };
+}
+
+export async function deleteProfileImageService({ userId }: { userId: string }) {
+  const existingUser = await prisma.user.findUnique({
+    where: { id: userId },
+  });
+
+  if (!existingUser) {
+    const err: any = new Error("User not found");
+    err.code = "USER_NOT_FOUND";
+    throw err;
+  }
+
+  const updatedUser = await prisma.user.update({
+    where: { id: userId },
+    data: {
+      avatar_url: null,
+    },
+  });
+
+  const userRole = await prisma.user_roles.findFirst({
+    where: { user_id: userId },
+    include: { role: true },
+  });
+
+  return {
+    success: true,
+    message: "Profile image removed successfully",
+    user: {
+      id: updatedUser.id,
+      email: updatedUser.email,
+      name: updatedUser.name,
+      role: userRole?.role.name || "USER",
+      avatar_url: updatedUser.avatar_url,
+    },
+  };
+}

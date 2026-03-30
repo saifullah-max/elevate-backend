@@ -1,0 +1,333 @@
+import { GoogleGenAI } from "@google/genai";
+import * as fs from "fs";
+import * as path from "path";
+import { promises as fsPromises } from "fs";
+import { logger } from "../utils/logger";
+import {
+  ImageProcessingError,
+  ImageErrorCode,
+  ErrorMessages,
+} from "../utils/imageErrors";
+
+const BATCH_POLL_INTERVAL_MS = 5000; // Poll every 5 seconds
+const MAX_POLL_ATTEMPTS = 1440; // 12 hours (5s × 1440 = 7200s = 2 hours for conservative estimate)
+
+interface BatchStagingRequest {
+  key: string; // e.g., "image-0-style-0"
+  imageId: string;
+  variationIndex: number;
+  request: any; // GenerateContentRequest
+}
+
+interface BatchStagingResult {
+  key: string;
+  imageId: string;
+  variationIndex: number;
+  stagedImageBase64?: string;
+  error?: string;
+}
+
+class BatchGeminiService {
+  private apiKey: string;
+  private client: GoogleGenAI;
+
+  constructor() {
+    this.apiKey = process.env.GEMINI_API_KEY || "";
+    if (!this.apiKey) {
+      throw new Error("GEMINI_API_KEY is not set in environment variables");
+    }
+    this.client = new GoogleGenAI({ apiKey: this.apiKey });
+  }
+
+  /**
+   * Stage multiple images using Batch API
+   * More efficient for large batches (15 images × 5 styles = 75 requests)
+   * Returns batch job ID for polling
+   */
+  async submitStagingBatch(batchRequests: BatchStagingRequest[]): Promise<string> {
+    try {
+      // Create JSONL file content
+      const jsonlContent = batchRequests
+        .map((req) => JSON.stringify({
+          key: req.key,
+          request: req.request,
+        }))
+        .join("\n");
+
+      // Write JSONL to temp file
+      const tempDir = path.join(process.cwd(), "uploads", "batch-temp");
+      await fsPromises.mkdir(tempDir, { recursive: true });
+      const tempFile = path.join(tempDir, `batch-${Date.now()}.jsonl`);
+      await fsPromises.writeFile(tempFile, jsonlContent);
+
+      logger(`[BATCH] Created JSONL file: ${tempFile} with ${batchRequests.length} requests`);
+
+      // Upload JSONL file to File API
+      const fileContent = await fsPromises.readFile(tempFile);
+      const uploadedFile = await this.client.files.upload({
+        file: new File([fileContent], `batch-staging-${Date.now()}.jsonl`, {
+          type: "application/x-jsonl",
+        }),
+      });
+
+      logger(`[BATCH] Uploaded file to Gemini: ${uploadedFile.name}`);
+
+      // Create batch job
+      const batchJob = await this.client.batches.create({
+        model: "gemini-3-pro-image-preview",
+        src: uploadedFile.name,
+        config: {
+          display_name: `multi-image-staging-${Date.now()}`,
+        },
+      });
+
+      logger(`[BATCH] Created batch job: ${batchJob.name}`);
+
+      // Clean up temp file
+      await fsPromises.unlink(tempFile);
+
+      return batchJob.name;
+    } catch (error) {
+      logger(`[BATCH] Error submitting staging batch: ${error}`);
+      throw new ImageProcessingError(
+        ImageErrorCode.AI_SERVICE_ERROR,
+        "Failed to submit batch staging request",
+        500
+      );
+    }
+  }
+
+  /**
+   * Poll batch job status until completion
+   */
+  async pollBatchStatus(jobName: string): Promise<{
+    completed: boolean;
+    state: string;
+    resultFileName?: string;
+  }> {
+    try {
+      const job = await this.client.batches.get({
+        name: jobName,
+      });
+
+      const completedStates = [
+        "JOB_STATE_SUCCEEDED",
+        "JOB_STATE_FAILED",
+        "JOB_STATE_CANCELLED",
+        "JOB_STATE_EXPIRED",
+      ];
+
+      const isCompleted = completedStates.includes(job.state.name);
+
+      logger(`[BATCH] Job ${jobName} state: ${job.state.name}`);
+
+      return {
+        completed: isCompleted,
+        state: job.state.name,
+        resultFileName: job.dest?.file_name,
+      };
+    } catch (error) {
+      logger(`[BATCH] Error polling batch status: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Wait for batch to complete with polling
+   */
+  async waitForBatchCompletion(
+    jobName: string,
+    pollIntervalMs: number = BATCH_POLL_INTERVAL_MS,
+    maxAttempts: number = MAX_POLL_ATTEMPTS
+  ): Promise<{
+    state: string;
+    resultFileName?: string;
+    success: boolean;
+  }> {
+    let attempts = 0;
+    const startTime = Date.now();
+
+    while (attempts < maxAttempts) {
+      try {
+        const status = await this.pollBatchStatus(jobName);
+
+        if (status.completed) {
+          const elapsedMs = Date.now() - startTime;
+          logger(`[BATCH] Job ${jobName} completed in ${Math.round(elapsedMs / 1000)}s`);
+
+          return {
+            state: status.state,
+            resultFileName: status.resultFileName,
+            success: status.state === "JOB_STATE_SUCCEEDED",
+          };
+        }
+
+        attempts++;
+        if (attempts % 12 === 0) {
+          const elapsedMinutes = Math.round((Date.now() - startTime) / 60000);
+          logger(`[BATCH] Job ${jobName} still running after ${elapsedMinutes} minutes...`);
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      } catch (error) {
+        logger(`[BATCH] Error in completion wait: ${error}`);
+        throw error;
+      }
+    }
+
+    throw new ImageProcessingError(
+      ImageErrorCode.AI_SERVICE_ERROR,
+      "Batch staging job timeout - still processing after 12 hours",
+      504
+    );
+  }
+
+  /**
+   * Retrieve and parse batch results
+   */
+  async getBatchResults(resultFileName: string): Promise<BatchStagingResult[]> {
+    try {
+      const fileContent = await this.client.files.download({
+        name: resultFileName,
+      });
+
+      const jsonlContent = fileContent.toString("utf-8");
+      const results: BatchStagingResult[] = [];
+
+      for (const line of jsonlContent.split("\n")) {
+        if (!line.trim()) continue;
+
+        try {
+          const parsed = JSON.parse(line);
+
+          if (parsed.error) {
+            results.push({
+              key: parsed.key || "unknown",
+              imageId: parsed.key?.split("-")?.[0] || "unknown",
+              variationIndex: parseInt(parsed.key?.split("-")?.[2] || "0"),
+              error: parsed.error.message || "Unknown error",
+            });
+          } else if (parsed.response) {
+            const imageBase64 = this.extractImageFromResponse(parsed.response);
+            results.push({
+              key: parsed.key || "unknown",
+              imageId: parsed.key?.split("-")?.[0] || "unknown",
+              variationIndex: parseInt(parsed.key?.split("-")?.[2] || "0"),
+              stagedImageBase64: imageBase64,
+            });
+          }
+        } catch (parseError) {
+          logger(`[BATCH] Error parsing result line: ${parseError}`);
+        }
+      }
+
+      logger(`[BATCH] Parsed ${results.length} results from batch job`);
+      return results;
+    } catch (error) {
+      logger(`[BATCH] Error retrieving batch results: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Extract base64 image data from Gemini response
+   */
+  private extractImageFromResponse(response: any): string | undefined {
+    try {
+      if (response.candidates && response.candidates.length > 0) {
+        const candidate = response.candidates[0];
+        if (candidate.content?.parts) {
+          for (const part of candidate.content.parts) {
+            if (part.inlineData?.data) {
+              return part.inlineData.data;
+            }
+          }
+        }
+      }
+    } catch (error) {
+      logger(`[BATCH] Error extracting image from response: ${error}`);
+    }
+    return undefined;
+  }
+
+  /**
+   * Create batch staging requests from image data
+   */
+  createBatchRequests(
+    images: Array<{
+      imageId: string;
+      base64Data: string;
+      mimeType: string;
+      roomType: string;
+      stagingStyle: string;
+      prompt?: string;
+    }>,
+    styles: string[]
+  ): BatchStagingRequest[] {
+    const requests: BatchStagingRequest[] = [];
+
+    images.forEach((image, imageIndex) => {
+      styles.forEach((style, styleIndex) => {
+        const prompt = this.buildStagingPrompt(image.roomType, style, image.prompt);
+        const key = `image-${imageIndex}-style-${styleIndex}`;
+
+        const request = {
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: image.mimeType,
+                    data: image.base64Data,
+                  },
+                },
+                {
+                  text: prompt,
+                },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ["IMAGE"],
+            temperature: 0.7,
+          },
+        };
+
+        requests.push({
+          key,
+          imageId: image.imageId,
+          variationIndex: styleIndex,
+          request,
+        });
+      });
+    });
+
+    return requests;
+  }
+
+  /**
+   * Build staging prompt (same logic as single image service)
+   */
+  private buildStagingPrompt(
+    roomType: string,
+    stagingStyle: string,
+    customPrompt?: string
+  ): string {
+    if (customPrompt) {
+      const doNotRemove =
+        "ABSOLUTELY DO NOT REMOVE, HIDE, OR ALTER ANY EXISTING PAINTINGS, WALL ART, OR DECORATIVE ITEMS.";
+      const lowerPrompt = customPrompt.toLowerCase();
+      const userRequestsRemoval = /remove|delete|empty|clear/.test(lowerPrompt);
+      if (userRequestsRemoval) {
+        return customPrompt;
+      } else {
+        return `${doNotRemove}\n${customPrompt}\n${doNotRemove}`;
+      }
+    }
+
+    return `Virtually stage this ${roomType} in ${stagingStyle} style. Add furniture, lighting, and decor. Do NOT change the architecture or fixed features. Do NOT remove any original paintings, wall art, or decorative items.`;
+  }
+}
+
+export const batchGeminiService = new BatchGeminiService();

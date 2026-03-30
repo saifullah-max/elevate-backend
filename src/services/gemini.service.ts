@@ -1,5 +1,4 @@
 import { GoogleGenAI } from "@google/genai";
-import * as fs from "fs";
 import { promises as fsPromises } from "fs";
 import * as path from "path";
 import { logger } from "../utils/logger";
@@ -15,6 +14,10 @@ import {
 const MAX_RETRIES = Number(process.env.GEMINI_MAX_RETRIES || "1");
 const BASE_DELAY_MS = Number(process.env.GEMINI_RETRY_BASE_DELAY_MS || "300");
 const MAX_DELAY_MS = Number(process.env.GEMINI_RETRY_MAX_DELAY_MS || "1200");
+const SINGLE_CALL_FAILURE_COOLDOWN_MS = Number(
+  process.env.GEMINI_SINGLE_CALL_FAILURE_COOLDOWN_MS || "3600000"
+);
+const SINGLE_CALL_MODE = String(process.env.GEMINI_SINGLE_CALL_MODE || "auto").toLowerCase(); // auto | always | never
 
 // Gemini API rate limiter: 18 requests/minute (safety buffer below 20/min limit)
 const GEMINI_RATE_LIMIT = Number(process.env.GEMINI_RATE_LIMIT_PER_MINUTE || "18");
@@ -33,6 +36,7 @@ function isQuotaExhaustedMessage(message: string): boolean {
 class GeminiService {
   private apiKey: string;
   private client: GoogleGenAI;
+  private singleCallFailureUntil = 0;
 
   constructor() {
     this.apiKey = process.env.GEMINI_API_KEY || "";
@@ -42,6 +46,244 @@ class GeminiService {
 
     // Initialize Gemini client
     this.client = new GoogleGenAI({ apiKey: this.apiKey });
+  }
+
+  private extractImagesFromResponse(response: any, maxImages: number): Buffer[] {
+    const extracted: Buffer[] = [];
+    const seen = new Set<string>();
+
+    for (const candidate of response?.candidates || []) {
+      for (const part of candidate?.content?.parts || []) {
+        if (!part?.inlineData?.data) {
+          continue;
+        }
+
+        if (part?.thought === true) {
+          continue;
+        }
+
+        const fingerprint = String(part.inlineData.data);
+        if (seen.has(fingerprint)) {
+          continue;
+        }
+
+        seen.add(fingerprint);
+        extracted.push(Buffer.from(part.inlineData.data, "base64"));
+
+        if (extracted.length >= maxImages) {
+          return extracted;
+        }
+      }
+    }
+
+    return extracted;
+  }
+
+  private shouldAttemptSingleCall(variationCount: number): boolean {
+    if (variationCount <= 1) {
+      return false;
+    }
+
+    if (SINGLE_CALL_MODE === "never") {
+      return false;
+    }
+
+    if (SINGLE_CALL_MODE === "always") {
+      return true;
+    }
+
+    return Date.now() >= this.singleCallFailureUntil;
+  }
+
+  private noteSingleCallFailure(reason: string): void {
+    if (SINGLE_CALL_MODE !== "auto") {
+      return;
+    }
+
+    this.singleCallFailureUntil = Date.now() + SINGLE_CALL_FAILURE_COOLDOWN_MS;
+    logger(
+      `[GEMINI] Single-call multi-variation disabled for ${Math.round(
+        SINGLE_CALL_FAILURE_COOLDOWN_MS / 1000
+      )}s due to ${reason}`
+    );
+  }
+
+  private buildStagingPrompt(
+    roomType: string,
+    stagingStyle: string,
+    prompt?: string,
+    variationCount: number = 1
+  ): string {
+    const groundingRules =
+      "Use the PROVIDED IMAGE as the only source scene. Keep the exact same room geometry, camera angle, walls, windows, doors, floor, and lighting direction. Do not generate a new or unrelated room. Return exactly ONE full-frame staged image. Do NOT create a collage, split-screen, multi-panel, contact sheet, or multiple views in one image.";
+
+    let stagingPrompt: string;
+
+    if (prompt) {
+      const doNotRemove =
+        "ABSOLUTELY DO NOT REMOVE, HIDE, OR ALTER ANY EXISTING PAINTINGS, WALL ART, OR DECORATIVE ITEMS. THIS IS CRITICAL. ONLY ADD OR IMPROVE, NEVER REMOVE. DO NOT REMOVE ANYTHING FROM THE ORIGINAL IMAGE UNLESS I EXPLICITLY SAY SO.";
+      const lowerPrompt = prompt.toLowerCase();
+      const userRequestsRemoval = /remove|delete|empty|clear|no decor|no painting|no wall art/.test(lowerPrompt);
+      if (userRequestsRemoval) {
+        stagingPrompt = prompt;
+      } else {
+        stagingPrompt = `${doNotRemove}\n${prompt}\n${doNotRemove}`;
+      }
+    } else if (STAGING_STYLE_PROMPTS[stagingStyle?.toLowerCase()]) {
+      stagingPrompt = STAGING_STYLE_PROMPTS[stagingStyle.toLowerCase()](roomType);
+    } else {
+      stagingPrompt = DEFAULT_STAGING_PROMPT(roomType, stagingStyle);
+    }
+
+    if (variationCount > 1) {
+      return `${groundingRules}\n\n${stagingPrompt}\n\nGenerate ${variationCount} distinct staged variations in one response. Each variation must keep the same architecture and camera perspective, while varying furniture layout, decor accents, and styling details.`;
+    }
+
+    return `${groundingRules}\n\n${stagingPrompt}`;
+  }
+
+  private async generateStagedImages(
+    inputImagePath: string,
+    roomType: string,
+    stagingStyle: string,
+    prompt?: string,
+    variationCount: number = 1,
+    removeFurniture?: boolean
+  ): Promise<Buffer[]> {
+    const safeVariationCount = Math.max(1, Math.min(variationCount, 8));
+    const imageBuffer = await fsPromises.readFile(inputImagePath);
+    const mimeType = this.getMimeType(inputImagePath);
+    const base64Image = imageBuffer.toString("base64");
+
+    const stagingPrompt = this.buildStagingPrompt(roomType, stagingStyle, prompt, safeVariationCount);
+    const singleCallPrompt = `${stagingPrompt}\n\nReturn exactly ${safeVariationCount} final staged IMAGE outputs in this single response. Each output must be one full-frame image only (no collage or split). Keep the original architecture unchanged.`;
+
+    return this.executeWithRetry(async () => {
+      const generated: Buffer[] = [];
+      const seen = new Set<string>();
+      let geminiCallCount = 0;
+      let usedSingleCallOnly = false;
+
+      if (this.shouldAttemptSingleCall(safeVariationCount)) {
+        try {
+          await geminiRateLimiter.acquire(`stageImage-${safeVariationCount}-single`);
+          logger(`[GEMINI] Starting single-call staging generation with ${safeVariationCount} variations`);
+          geminiCallCount += 1;
+
+          const response = await this.client.models.generateContent({
+            model: "gemini-3-pro-image-preview",
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType,
+                      data: base64Image,
+                    },
+                  },
+                  {
+                    text: singleCallPrompt,
+                  },
+                ],
+              },
+            ],
+            config: {
+              responseModalities: ["IMAGE"],
+              temperature: 0.7,
+            },
+          } as any);
+
+          const images = this.extractImagesFromResponse(response, safeVariationCount);
+          if (images.length >= safeVariationCount) {
+            for (const image of images.slice(0, safeVariationCount)) {
+              const fp = image.toString("base64");
+              if (!seen.has(fp)) {
+                generated.push(image);
+                seen.add(fp);
+              }
+            }
+            usedSingleCallOnly = generated.length >= safeVariationCount;
+          } else if (images.length > 0) {
+            logger(`[GEMINI] Single-call returned partial output (${images.length}/${safeVariationCount}); discarding partial set and regenerating all variations individually.`);
+            this.noteSingleCallFailure(`partial output ${images.length}/${safeVariationCount}`);
+          }
+        } catch (error) {
+          this.noteSingleCallFailure("single-call error");
+          logger(`[GEMINI] Single-call multi-image attempt failed, falling back to per-variation calls: ${String(error)}`);
+        }
+      } else {
+        logger(`[GEMINI] Skipping single-call multi-variation attempt (mode=${SINGLE_CALL_MODE}) and generating per-variation directly.`);
+      }
+
+      if (!usedSingleCallOnly && generated.length < safeVariationCount) {
+        if (generated.length > 0) {
+          generated.length = 0;
+          seen.clear();
+        }
+        logger(`[GEMINI] Generating ${safeVariationCount - generated.length} remaining variations with per-variation calls (still one billed job)`);
+      }
+
+      for (let index = generated.length; index < safeVariationCount; index++) {
+        await geminiRateLimiter.acquire(`stageImage-${safeVariationCount}-v${index + 1}`);
+        geminiCallCount += 1;
+
+        const variationPrompt = prompt
+          ? `${prompt}\n\nCreate variation ${index + 1} of ${safeVariationCount}. Keep architecture unchanged and make this variation visually distinct from previous ones.`
+          : `Create variation ${index + 1} of ${safeVariationCount} for this ${roomType} in ${stagingStyle} style. Keep architecture unchanged and make this variation visually distinct from previous ones.`;
+
+        const perVariationPrompt = this.buildStagingPrompt(roomType, stagingStyle, variationPrompt, 1);
+
+        const variationResponse = await this.client.models.generateContent({
+          model: "gemini-3-pro-image-preview",
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  inlineData: {
+                    mimeType,
+                    data: base64Image,
+                  },
+                },
+                {
+                  text: perVariationPrompt,
+                },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ["IMAGE"],
+            temperature: 0.75,
+          },
+        } as any);
+
+        const nextImage = this.extractImagesFromResponse(variationResponse, 1)[0];
+        if (!nextImage) {
+          continue;
+        }
+
+        const fingerprint = nextImage.toString("base64");
+        if (!seen.has(fingerprint)) {
+          generated.push(nextImage);
+          seen.add(fingerprint);
+        }
+      }
+
+      if (generated.length < safeVariationCount) {
+        logger(`[GEMINI] API call count for this job: ${geminiCallCount} (single-call success: ${usedSingleCallOnly})`);
+        throw new ImageProcessingError(
+          ImageErrorCode.AI_NO_IMAGE_GENERATED,
+          ErrorMessages[ImageErrorCode.AI_NO_IMAGE_GENERATED],
+          502,
+          `Gemini returned ${generated.length}/${safeVariationCount} staged images after fallback generation.`
+        );
+      }
+
+      logger(`[GEMINI] API call count for this job: ${geminiCallCount} (single-call success: ${usedSingleCallOnly})`);
+      logger(`[GEMINI] Staging generation succeeded with ${generated.length} images`);
+      return generated.slice(0, safeVariationCount);
+    }, "generateStagedImages");
   }
 
   /**
@@ -136,102 +378,33 @@ class GeminiService {
     prompt?: string,
     removeFurniture?: boolean
   ): Promise<Buffer> {
-    // Use async file read for better performance
-    const imageBuffer = await fsPromises.readFile(inputImagePath);
-    // Optimize: Check image size and compress if needed (max 4MB for Gemini)
-    const maxSize = 4 * 1024 * 1024; // 4MB
-    let optimizedBuffer = imageBuffer;
-    if (imageBuffer.length > maxSize) {
-      logger(`Image size ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB exceeds 4MB, optimizing...`);
-      // For now, we'll use the original, but you could add image compression here
-      // Consider using sharp or jimp to resize/compress if needed
-    }
-    const base64Image = optimizedBuffer.toString("base64");
-    const mimeType = this.getMimeType(inputImagePath);
+    const images = await this.generateStagedImages(
+      inputImagePath,
+      roomType,
+      stagingStyle,
+      prompt,
+      1,
+      removeFurniture
+    );
+    return images[0];
+  }
 
-    // Compose a more detailed prompt for Gemini
-    let stagingPrompt: string;
-    // if (removeFurniture) {
-    //   // Remove furniture prompt (dedicated, no staging style or user prompt)
-    //   stagingPrompt = `Remove all movable furniture and decor from the room, leaving only the fixed architectural features (walls, windows, doors, ceiling, floor, lighting, etc). Do not change the layout, wall color, wall structure, ceiling, LED lights position, window/door positions, or any fixed architectural features. The room's structure and permanent features must remain exactly as in the original image.`;
-    // } else 
-    if (prompt) {
-      // Strongly reinforce "do not remove" at start and end unless user prompt explicitly requests removal
-      const doNotRemove =
-        "ABSOLUTELY DO NOT REMOVE, HIDE, OR ALTER ANY EXISTING PAINTINGS, WALL ART, OR DECORATIVE ITEMS. THIS IS CRITICAL. ONLY ADD OR IMPROVE, NEVER REMOVE. DO NOT REMOVE ANYTHING FROM THE ORIGINAL IMAGE UNLESS I EXPLICITLY SAY SO.";
-      // If the prompt contains 'remove' or 'delete' or 'empty' (case-insensitive), do not add the doNotRemove guard
-      const lowerPrompt = prompt.toLowerCase();
-      const userRequestsRemoval = /remove|delete|empty|clear|no decor|no painting|no wall art/.test(lowerPrompt);
-      if (userRequestsRemoval) {
-        stagingPrompt = prompt;
-      } else {
-        stagingPrompt = `${doNotRemove}\n${prompt}\n${doNotRemove}`;
-      }
-    } else if (STAGING_STYLE_PROMPTS[stagingStyle?.toLowerCase()]) {
-      stagingPrompt = STAGING_STYLE_PROMPTS[stagingStyle.toLowerCase()](roomType);
-    } else {
-      stagingPrompt = DEFAULT_STAGING_PROMPT(roomType, stagingStyle);
-    }
-
-    return this.executeWithRetry(async () => {
-      // Apply rate limiting BEFORE making the API call
-      const rateLimitDelay = await geminiRateLimiter.acquire(`stageImage`);
-      
-      const startTime = Date.now();
-
-      let stagedImageData: Buffer | null = null;
-
-      try {
-        const response = await this.client.models.generateContent({
-          model: "gemini-3-pro-image-preview",
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: mimeType,
-                    data: base64Image,
-                  },
-                },
-                { text: stagingPrompt },
-              ],
-            },
-          ],
-          config: {
-            responseModalities: ["IMAGE"],
-            temperature: 0.7,
-          },
-        });
-
-        // Extract image from response
-        if (response.candidates && response.candidates.length > 0) {
-          for (const candidate of response.candidates) {
-            if (candidate.content?.parts) {
-              for (const part of candidate.content.parts) {
-                if (part.inlineData?.data) {
-                  stagedImageData = Buffer.from(part.inlineData.data, "base64");
-                  break;
-                }
-              }
-            }
-          }
-        }
-      } catch (err) {
-        logger(`Gemini image generation error: ${err}`);
-        throw err;
-      }
-
-      if (!stagedImageData) {
-        throw new ImageProcessingError(
-          ImageErrorCode.AI_NO_IMAGE_GENERATED,
-          ErrorMessages[ImageErrorCode.AI_NO_IMAGE_GENERATED],
-          500
-        );
-      }
-
-      return stagedImageData;
-    }, "stageImage");
+  async stageImageVariations(
+    inputImagePath: string,
+    roomType: string,
+    stagingStyle: string,
+    variationCount: number,
+    prompt?: string,
+    removeFurniture?: boolean
+  ): Promise<Buffer[]> {
+    return this.generateStagedImages(
+      inputImagePath,
+      roomType,
+      stagingStyle,
+      prompt,
+      variationCount,
+      removeFurniture
+    );
   }
 
 

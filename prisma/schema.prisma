@@ -42,6 +42,7 @@ model user {
   credit_purchases      user_credit_purchase[] @relation("CreditPurchases")
   credit_usage          user_credit_usage[]
   demo_tracking         user_demo_tracking?
+  invoices              invoice[]
 
   @@map("user")
 }
@@ -132,20 +133,29 @@ model user_credit_balance {
 
 // User purchases personal credits
 model user_credit_purchase {
-  id                String         @id @default(uuid()) @map("id")
-  user_id           String         @map("user_id")
-  package_id        String         @map("package_id")
-  amount            Int            @map("amount")
-  price_usd         Float          @map("price_usd")
-  status            String         @default("pending") @map("status")
-  stripe_session_id String?        @map("stripe_session_id")
-  stripe_invoice_id String?        @map("stripe_invoice_id")
-  created_at        DateTime       @default(now()) @map("created_at")
-  completed_at      DateTime?      @map("completed_at")
-  user              user           @relation("CreditPurchases", fields: [user_id], references: [id])
-  package           credit_package @relation("UserCreditPurchases", fields: [package_id], references: [id])
+  id                   String         @id @default(uuid()) @map("id")
+  user_id              String         @map("user_id")
+  package_id           String         @map("package_id")
+  amount               Int            @map("amount")
+  price_usd            Float          @map("price_usd")
+  status               String         @default("pending") @map("status")
+  stripe_session_id    String?        @map("stripe_session_id")
+  stripe_invoice_id    String?        @map("stripe_invoice_id")
+  created_at           DateTime       @default(now()) @map("created_at")
+  completed_at         DateTime?      @map("completed_at")
+  // Auto-renewal fields
+  autoRenewEnabled     Boolean        @default(true) @map("auto_renew_enabled")
+  nextRenewalDate      DateTime?      @map("next_renewal_date")
+  renewalCount         Int            @default(0) @map("renewal_count")
+  // Cancellation fields
+  cancelledAt          DateTime?      @map("cancelled_at")
+  cancellationReason   String?        @map("cancellation_reason")
+  user                 user           @relation("CreditPurchases", fields: [user_id], references: [id])
+  package              credit_package @relation("UserCreditPurchases", fields: [package_id], references: [id])
+  invoices             invoice[]
 
   @@index([user_id, status])
+  @@index([autoRenewEnabled, nextRenewalDate])
   @@map("user_credit_purchase")
 }
 
@@ -463,6 +473,25 @@ enum auth_provider {
   APPLE
 
   @@map("auth_provider")
+}
+
+model invoice {
+  id                String                 @id @default(uuid()) @map("id")
+  subscription_id   String                 @map("subscription_id")
+  user_id           String                 @map("user_id")
+  amount            Float                  @map("amount")
+  status            String                 @default("generated") @map("status")
+  html_content      String?                @map("html_content")
+  metadata          Json?                  @map("metadata")
+  created_at        DateTime               @default(now()) @map("created_at")
+  updated_at        DateTime               @updatedAt @map("updated_at")
+  subscription      user_credit_purchase   @relation(fields: [subscription_id], references: [id], onDelete: Cascade)
+  user              user                   @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([subscription_id])
+  @@index([created_at])
+  @@map("invoice")
 }
 
 enum image_status {

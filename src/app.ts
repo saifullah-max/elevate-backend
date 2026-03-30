@@ -11,6 +11,10 @@ import teamsCreditRoute from './api/teams.credits.route'
 import projectsRoute from './api/projects.route'
 import paymentRoutes from './api/payment.routes'
 import adminLogsRoute from './api/admin-logs.route'
+import legalDocumentsRoute from './api/legal-documents.route'
+import subscriptionRoutes from './api/subscription.route'
+import paymentHistoryRoutes from './api/payment-history.route'
+import debugRoutes from './api/debug.route'
 import { stripeWebhookHandler } from "./controllers/payment.controller";
 import { errorHandler } from "./middlewares/errorHandler";
 import { zodErrorHandler } from "./middlewares/zodErrorHandler";
@@ -94,7 +98,11 @@ app.use('/api/teams', teamsRoute)
 app.use('/api/teams/credits', teamsCreditRoute)
 app.use('/api/projects', projectsRoute)
 app.use('/api/payment', paymentRoutes)
+app.use('/api/payments', paymentHistoryRoutes)
 app.use('/api/admin/logs', adminLogsRoute)
+app.use('/api/legal-documents', legalDocumentsRoute)
+app.use('/api/subscriptions', subscriptionRoutes)
+app.use('/debug', debugRoutes)
 
 /* =======================
    ERROR HANDLERS

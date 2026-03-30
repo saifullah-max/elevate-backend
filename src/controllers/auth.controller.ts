@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { ZodError } from "zod";
 import { loginSchema, signupSchema } from "../utils/authSchemas";
-import { loginService, signupService } from "../services/auth.service";
+import { loginService, signupService, updateProfileImageService, deleteProfileImageService } from "../services/auth.service";
 import { oauthService } from "../services/oauth.service";
 import { logger } from "../utils/logger";
 import { OAuthResult } from "../types/auth";
@@ -103,6 +103,10 @@ export async function login(req: Request, res: Response) {
 
 export async function oauthCallback(req: Request, res: Response) {
   try {
+    res.clearCookie("oauth_intent");
+    res.clearCookie("oauth_agreements_accepted");
+    res.clearCookie("oauth_error");
+
     if (!req.user) {
       logger("OAuth callback: req.user is missing");
       return res.redirect(`${FRONTEND_URL}/auth/callback?error=auth_failed`);
@@ -165,23 +169,38 @@ export async function oauthCallback(req: Request, res: Response) {
 
 export async function oauthFailure(req: Request, res: Response) {
   const provider = req.query.provider || "unknown";
+  const errorCode = typeof req.query.error === "string" ? req.query.error : "auth_failed";
   logger(`OAuth failure: provider=${provider}`);
 
-  // Check if this is an API request or browser redirect
-  const acceptsJson = req.accepts("json");
+  // Only return JSON for explicit programmatic/API requests.
+  // Browser OAuth flows should always redirect back to frontend.
+  const isExplicitApiRequest =
+    req.query.format === "json" ||
+    req.get("x-requested-with") === "XMLHttpRequest";
 
-  if (acceptsJson) {
+  if (isExplicitApiRequest) {
     return res.status(401).json({
       success: false,
       error: {
         code: "OAUTH_FAILED",
         message: `${String(provider).charAt(0).toUpperCase() + String(provider).slice(1)} authentication failed. Please try again.`,
         provider,
+        reason: errorCode,
       },
     });
   }
 
-  return res.redirect(`${FRONTEND_URL}/auth/callback?error=auth_failed&provider=${provider}`);
+  res.clearCookie("oauth_intent");
+  res.clearCookie("oauth_agreements_accepted");
+  res.cookie("oauth_error", errorCode, {
+    httpOnly: false,
+    sameSite: "lax",
+    maxAge: 5 * 60 * 1000,
+    path: "/",
+  });
+
+  const attempt = Date.now().toString();
+  return res.redirect(`${FRONTEND_URL}/sign-in?error=${encodeURIComponent(errorCode)}&provider=${provider}&attempt=${attempt}`);
 }
 
 export async function getAvailableProviders(req: Request, res: Response) {
@@ -190,4 +209,48 @@ export async function getAvailableProviders(req: Request, res: Response) {
     success: true,
     providers,
   });
+}
+
+export async function updateProfileImage(req: Request, res: Response) {
+  try {
+    const userId = req.user?.id;
+    const file = req.file;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    if (!file) {
+      return res.status(400).json({ success: false, message: "Profile image file is required" });
+    }
+
+    const host = req.get("host") || "localhost:3003";
+    const avatarUrl = `${req.protocol}://${host}/uploads/original/${file.filename}`;
+
+    const result = await updateProfileImageService({ userId, avatarUrl });
+    return res.status(200).json(result);
+  } catch (error: any) {
+    return res.status(400).json({
+      success: false,
+      message: error?.message || "Failed to update profile image",
+    });
+  }
+}
+
+export async function deleteProfileImage(req: Request, res: Response) {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const result = await deleteProfileImageService({ userId });
+    return res.status(200).json(result);
+  } catch (error: any) {
+    return res.status(400).json({
+      success: false,
+      message: error?.message || "Failed to delete profile image",
+    });
+  }
 }

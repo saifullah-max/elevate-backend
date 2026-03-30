@@ -3,10 +3,19 @@ import sgMail from "@sendgrid/mail";
 dotenv.config();
 
 // SendGrid HTTP API Configuration (use environment variables)
-const SENDGRID_API_KEY = process.env.SMTP_PASS || process.env.SENDGRID_API_KEY;
+const sendgridApiKeyFromEnv = process.env.SENDGRID_API_KEY;
+const fallbackSmtpPass = process.env.SMTP_PASS;
+
+const SENDGRID_API_KEY =
+    sendgridApiKeyFromEnv ||
+    (fallbackSmtpPass && fallbackSmtpPass.startsWith("SG.")
+        ? fallbackSmtpPass
+        : undefined);
 
 if (!SENDGRID_API_KEY) {
-    throw new Error("SendGrid API key is missing. Set SMTP_PASS or SENDGRID_API_KEY.");
+    throw new Error(
+        "SendGrid API key is missing or invalid. Set SENDGRID_API_KEY to a valid SendGrid key (starts with SG.)."
+    );
 }
 
 sgMail.setApiKey(SENDGRID_API_KEY);
@@ -35,7 +44,7 @@ export const sendEmail = async ({
     senderEmail,
 }: EmailProps) => {
     // SendGrid requires verified sender email
-    const verifiedSender = "saifullahahmed380@gmail.com"; // Your verified SendGrid sender
+    const verifiedSender = process.env.SENDGRID_VERIFIED_SENDER || "saifullahahmed380@gmail.com";
     
     const msg = {
         to,
@@ -81,6 +90,7 @@ export const sendEmail = async ({
         console.error("❌ SendGrid error:", {
             message: err.message,
             code: err.code,
+            statusCode: err.response?.statusCode,
             response: err.response?.body,
         });
         throw err;

@@ -33,7 +33,10 @@ export async function createCheckoutSessionHandler(req: Request, res: Response) 
                 code: error.code,
             });
         }
-        return res.status(400).json({ message: error.message || "Failed to create checkout session" });
+        return res.status(400).json({
+            message: error.message || "Failed to create checkout session",
+            ...(error?.code ? { code: error.code } : {}),
+        });
     }
 }
 

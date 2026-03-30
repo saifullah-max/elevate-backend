@@ -807,37 +807,33 @@ export async function generateImage(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    // Parallelize image generation for speed
     if (!inputImagePath) {
       res.write(`event: error\ndata: ${JSON.stringify({ message: 'No input image path' })}\n\n`);
       res.end();
       return;
     }
-    const imagePromises = Array.from({ length: NUM_VARIATIONS }).map(async (_, i) => {
-      try {
-        const variationPrompt = prompt ? `${prompt} [variation ${i + 1}]` : undefined;
-        // let unwatermarked = await geminiService.stageImage(
-        //   inputImagePath as string,
-        //   roomType.toLowerCase(),
-        //   stagingStyle.toLowerCase(),
-        //   variationPrompt,
-        //   removeFurniture
-        // );
-        let unwatermarked = await geminiService.stageImage(
-          inputImagePath as string,
-          roomType.toLowerCase(),
-          stagingStyle.toLowerCase(),
-          variationPrompt
-        );
+    let hasSuccessfulGeneration = false;
+    try {
+      const generatedVariations = await geminiService.stageImageVariations(
+        inputImagePath as string,
+        roomType.toLowerCase(),
+        stagingStyle.toLowerCase(),
+        NUM_VARIATIONS,
+        prompt
+      );
+
+      for (let i = 0; i < generatedVariations.length; i++) {
+        let unwatermarked = generatedVariations[i];
         let watermarked = unwatermarked;
         if (isDemo && watermarked) {
           watermarked = await addWatermark(watermarked, "DEMO PREVIEW");
         }
+
         const stagedFileName = `staged-${Date.now()}-${i}.png`;
         const unwatermarkedFileName = `staged-unwatermarked-${Date.now()}-${i}.png`;
         const stagedUrl = await supabaseStorage.uploadStagedFromBuffer(watermarked, stagedFileName, "image/png");
         await supabaseStorage.uploadStagedFromBuffer(unwatermarked, unwatermarkedFileName, "image/png");
-        // Save to database
+
         const imageRecord = await prisma.image.create({
           data: {
             user_id: userId,
@@ -854,7 +850,6 @@ export async function generateImage(req: Request, res: Response): Promise<void> 
           }
         });
 
-        // Stream each image as soon as it's ready
         res.write(`event: image\ndata: ${JSON.stringify({
           stagedImageUrl: stagedUrl,
           stagedId: unwatermarkedFileName,
@@ -868,14 +863,15 @@ export async function generateImage(req: Request, res: Response): Promise<void> 
           demoCount: isDemo ? unifiedCount : undefined,
           demoLimit: isDemo ? DEMO_LIMIT : undefined,
         })}\n\n`);
-      } catch (err) {
-        res.write(`event: error\ndata: ${JSON.stringify({ message: 'Failed to generate or upload image', error: String(err) })}\n\n`);
+
+        hasSuccessfulGeneration = true;
       }
-    });
-    await Promise.all(imagePromises);
+    } catch (err) {
+      res.write(`event: error\ndata: ${JSON.stringify({ message: 'Failed to generate or upload image', error: String(err) })}\n\n`);
+    }
 
     // Deduct credits after successful generation (1 credit per image set)
-    if (userId && teamId) {
+    if (hasSuccessfulGeneration && userId && teamId) {
       try {
         if (isTeamOwner) {
           // Deduct from team wallet
@@ -904,7 +900,7 @@ export async function generateImage(req: Request, res: Response): Promise<void> 
         logger(`Failed to deduct credits: ${err}`);
         // Don't fail the request, just log the error
       }
-    } else if (userId && !teamId) {
+    } else if (hasSuccessfulGeneration && userId && !teamId) {
       // Deduct from personal credits
       try {
         await prisma.user_credit_balance.update({
