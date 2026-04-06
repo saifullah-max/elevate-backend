@@ -19,6 +19,41 @@ export interface RenewalResult {
     error?: string;
 }
 
+const SUBSCRIPTION_INTERVAL_DAYS = Math.max(
+    1,
+    Number(process.env.SUBSCRIPTION_INTERVAL_DAYS || "30")
+);
+
+function addDays(base: Date, days: number): Date {
+    const result = new Date(base);
+    result.setDate(result.getDate() + days);
+    return result;
+}
+
+function getFirstPaymentDate(subscription: {
+    completed_at?: Date | null;
+    created_at: Date;
+}): Date {
+    return subscription.completed_at || subscription.created_at;
+}
+
+function getLastPaymentDate(subscription: {
+    renewalCount: number;
+    nextRenewalDate?: Date | null;
+    completed_at?: Date | null;
+    created_at: Date;
+}): Date {
+    if (subscription.nextRenewalDate) {
+        return addDays(subscription.nextRenewalDate, -SUBSCRIPTION_INTERVAL_DAYS);
+    }
+
+    if (subscription.renewalCount > 0) {
+        return subscription.completed_at || subscription.created_at;
+    }
+
+    return subscription.completed_at || subscription.created_at;
+}
+
 function isDatabaseUnavailableError(error: any): boolean {
     if (!error) return false;
 
@@ -108,6 +143,9 @@ export class SubscriptionRenewalService {
                 select: {
                     id: true,
                     completed_at: true,
+                    created_at: true,
+                    nextRenewalDate: true,
+                    renewalCount: true,
                 },
             });
 
@@ -118,9 +156,8 @@ export class SubscriptionRenewalService {
 
                 await Promise.all(
                     invalidRenewalDateSubscriptions.map((subscription) => {
-                        const baseDate = subscription.completed_at || new Date();
-                        const nextRenewalDate = new Date(baseDate);
-                        nextRenewalDate.setMinutes(nextRenewalDate.getMinutes() + 1);
+                        const baseDate = getLastPaymentDate(subscription);
+                        const nextRenewalDate = addDays(baseDate, SUBSCRIPTION_INTERVAL_DAYS);
 
                         return prisma.user_credit_purchase.update({
                             where: { id: subscription.id },
@@ -162,6 +199,28 @@ export class SubscriptionRenewalService {
                 `Found ${dueRenewals.length} subscriptions due for renewal (${dueRenewalsByUser.length} unique users to process)`
             );
 
+            const completedNonAutoSubscriptions = await prisma.user_credit_purchase.findMany({
+                where: {
+                    autoRenewEnabled: false,
+                    cancelledAt: null,
+                    status: "completed",
+                },
+                include: {
+                    user: true,
+                    package: true,
+                },
+            });
+
+            const dueCancellations = completedNonAutoSubscriptions.filter((subscription) => {
+                const firstPaymentDate = getFirstPaymentDate(subscription);
+                const expiryDate = addDays(firstPaymentDate, SUBSCRIPTION_INTERVAL_DAYS);
+                return expiryDate <= now;
+            });
+
+            console.log(
+                `Found ${dueCancellations.length} non-auto subscriptions due for cancellation after ${SUBSCRIPTION_INTERVAL_DAYS} days`
+            );
+
             for (const subscription of dueRenewalsByUser) {
                 processed++;
                 try {
@@ -178,6 +237,27 @@ export class SubscriptionRenewalService {
                     failed++;
                     console.error(
                         `Exception during renewal for subscription ${subscription.id}:`,
+                        error
+                    );
+                }
+            }
+
+            for (const subscription of dueCancellations) {
+                processed++;
+                try {
+                    const result = await this.expireNonAutoRenewSubscription(subscription);
+                    if (result.success) {
+                        successful++;
+                    } else {
+                        failed++;
+                        console.error(
+                            `Cancellation failed for non-auto subscription ${subscription.id}: ${result.error}`
+                        );
+                    }
+                } catch (error) {
+                    failed++;
+                    console.error(
+                        `Exception during cancellation for non-auto subscription ${subscription.id}:`,
                         error
                     );
                 }
@@ -277,12 +357,8 @@ export class SubscriptionRenewalService {
                 };
             }
 
-            // Update subscription record
-            // const nextRenewalDate = new Date();
-            // nextRenewalDate.setMonth(nextRenewalDate.getMonth() + 1);
-
-            const nextRenewalDate = new Date();
-            nextRenewalDate.setMinutes(nextRenewalDate.getMinutes() + 1);
+            // Next charge should happen after an exact interval from this successful payment.
+            const nextRenewalDate = addDays(new Date(), SUBSCRIPTION_INTERVAL_DAYS);
 
             await prisma.$transaction([
                 prisma.user_credit_purchase.update({
@@ -362,6 +438,59 @@ export class SubscriptionRenewalService {
         }
     }
 
+    private static async expireNonAutoRenewSubscription(subscription: any): Promise<RenewalResult> {
+        try {
+            const firstPaymentDate = getFirstPaymentDate(subscription);
+            const expiryDate = addDays(firstPaymentDate, SUBSCRIPTION_INTERVAL_DAYS);
+
+            await prisma.user_credit_purchase.update({
+                where: { id: subscription.id },
+                data: {
+                    cancelledAt: new Date(),
+                    cancellationReason: `Auto-renew disabled; subscription expired after ${SUBSCRIPTION_INTERVAL_DAYS} days from initial payment`,
+                    nextRenewalDate: null,
+                },
+            });
+
+            await sendEmail({
+                from: "noreply@elevatedspaces.com",
+                senderName: "Elevated Spaces",
+                to: subscription.user.email,
+                subject: "Subscription Expired - Auto Renewal Disabled",
+                text: `Your ${subscription.package.name} subscription has ended because auto-renewal was disabled. It expired ${SUBSCRIPTION_INTERVAL_DAYS} days after your first payment.`,
+                html: `
+                    <h2>Subscription Expired</h2>
+                    <p>Hi ${subscription.user.name || "there"},</p>
+                    <p>Your <strong>${subscription.package.name}</strong> subscription has been cancelled because auto-renewal is disabled.</p>
+                    <ul>
+                        <li>First payment date: ${firstPaymentDate.toLocaleDateString()}</li>
+                        <li>Expiry date: ${expiryDate.toLocaleDateString()}</li>
+                        <li>Policy: ${SUBSCRIPTION_INTERVAL_DAYS} days from first payment when auto-renew is off</li>
+                    </ul>
+                    <p>If you want to continue, you can purchase a new package anytime from your account.</p>
+                `,
+            });
+
+            console.log(
+                `Cancelled non-auto subscription ${subscription.id} for user ${subscription.user.id} after ${SUBSCRIPTION_INTERVAL_DAYS} days from first payment`
+            );
+
+            return {
+                success: true,
+                message: "Non-auto subscription cancelled after expiry",
+                subscriptionId: subscription.id,
+            };
+        } catch (error) {
+            const errorMessage =
+                error instanceof Error ? error.message : "Unknown error";
+            return {
+                success: false,
+                message: "Failed to cancel expired non-auto subscription",
+                error: errorMessage,
+            };
+        }
+    }
+
     /**
      * Enable auto-renewal for a subscription
      */
@@ -396,12 +525,26 @@ export class SubscriptionRenewalService {
                 },
             });
 
-            // Calculate next renewal date (1 month from now)
-            // const nextRenewalDate = new Date();
-            // nextRenewalDate.setMonth(nextRenewalDate.getMonth() + 1);
+            const subscription = await prisma.user_credit_purchase.findUnique({
+                where: { id: subscriptionId },
+                select: {
+                    renewalCount: true,
+                    nextRenewalDate: true,
+                    completed_at: true,
+                    created_at: true,
+                },
+            });
 
-            const nextRenewalDate = new Date();
-            nextRenewalDate.setMinutes(nextRenewalDate.getMinutes() + 1);
+            if (!subscription) {
+                return {
+                    success: false,
+                    message: "Subscription not found",
+                    error: "Not found",
+                };
+            }
+
+            const lastPaymentDate = getLastPaymentDate(subscription);
+            const nextRenewalDate = addDays(lastPaymentDate, SUBSCRIPTION_INTERVAL_DAYS);
 
             await prisma.user_credit_purchase.update({
                 where: { id: subscriptionId },

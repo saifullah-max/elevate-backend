@@ -10,7 +10,8 @@
     "build": "prisma generate && tsc",
     "postinstall": "prisma generate",
     "start": "node dist/server.js",
-    "dev": "nodemon --watch src --ext ts,js,json --exec ts-node src/server.ts"
+    "dev": "nodemon --watch src --ext ts,js,json --exec ts-node src/server.ts",
+    "audit:ai": "ts-node scripts/audit-ai-costs.ts"
   },
   "prisma": {
     "seed": "ts-node ./scripts/seed.ts"

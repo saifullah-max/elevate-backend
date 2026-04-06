@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { generateImage, getRecentUploads, analyzeImage, generateMultipleImages, restageImage } from "../controllers/image.controller";
+import { generateImage, stageSingleImageWithFallback, getRecentUploads, analyzeImage, generateMultipleImages, restageImage } from "../controllers/image.controller";
 import { uploadImage, uploadImages } from "../middlewares/uploadImage";
 import { requireAuth, optionalAuth } from "../middlewares/auth";
 
@@ -9,7 +9,12 @@ const router = Router();
 router.get("/recent", requireAuth, getRecentUploads);
 
 // Generate/stage an image using AI
-router.post("/generate", optionalAuth, uploadImage, generateImage);
+// Backward-compatible alias: keep /generate pointed to dual-model flow so older frontend builds still receive variants
+router.post("/generate", optionalAuth, uploadImage, stageSingleImageWithFallback);
+
+// NEW: Dual-model flow (Gemini + Replicate variants) - optimized for cost
+router.post("/stage-with-variants", optionalAuth, uploadImage, stageSingleImageWithFallback);
+
 // Restage a previously staged image (variation/edit)
 router.post("/restage", optionalAuth, uploadImage, restageImage);
 

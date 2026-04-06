@@ -1,5 +1,6 @@
 import { ImageStatus } from "../types/image.types";
 import { geminiService } from "./gemini.service";
+import { fallbackImageService } from "./fallbackImage.service";
 import { logger } from "../utils/logger";
 import prisma from "../dbConnection";
 import { supabaseStorage } from "./supabaseStorage.service";
@@ -12,8 +13,9 @@ interface BatchStageJob {
     customPrompt?: string;
 }
 
-const VARIATIONS_PER_IMAGE = Number(process.env.MULTI_STAGE_VARIATIONS || "5");
-const MAX_ATTEMPTS_PER_VARIATION = Number(process.env.MULTI_STAGE_MAX_ATTEMPTS || "2");
+const VARIATIONS_PER_IMAGE = 3;
+const FALLBACK_VARIANTS_PER_IMAGE = 2;
+const MAX_ATTEMPTS_PER_VARIATION = Number(process.env.MULTI_STAGE_MAX_ATTEMPTS || "1");
 const RETRY_BACKOFF_BASE_MS = Number(process.env.MULTI_STAGE_RETRY_BACKOFF_MS || "120");
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -45,14 +47,13 @@ export async function processBatchImage(job: BatchStageJob): Promise<void> {
             data: { status: ImageStatus.PROCESSING },
         });
 
-        let generatedVariations: Buffer[] = [];
+        let primaryVariant: Buffer | null = null;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_VARIATION; attempt++) {
             try {
-                generatedVariations = await geminiService.stageImageVariations(
+                primaryVariant = await geminiService.stageImage(
                     originalPath,
                     roomType,
                     stagingStyle,
-                    VARIATIONS_PER_IMAGE,
                     customPrompt
                 );
                 break;
@@ -67,6 +68,35 @@ export async function processBatchImage(job: BatchStageJob): Promise<void> {
                 }
             }
         }
+
+        if (!primaryVariant) {
+            await prisma.image.update({
+                where: { id: imageId },
+                data: {
+                    status: ImageStatus.FAILED,
+                },
+            });
+            throw new Error(`Primary Gemini generation failed for image ${imageId}`);
+        }
+
+        let fallbackVariants: Buffer[] = [];
+        try {
+            fallbackVariants = await fallbackImageService.generateStyledVariants(
+                originalPath,
+                primaryVariant,
+                roomType,
+                stagingStyle,
+                customPrompt
+            );
+        } catch (fallbackErr) {
+            logger(`[JOB][${imageId.slice(0, 8)}] fallback generation warning: ${String(fallbackErr)}`);
+            fallbackVariants = [];
+        }
+
+        const generatedVariations = [
+            primaryVariant,
+            ...fallbackVariants.slice(0, FALLBACK_VARIANTS_PER_IMAGE),
+        ];
 
         const successfulVariants = await Promise.all(
             generatedVariations.map(async (stagedImageBuffer, variationIndex) => {
@@ -129,7 +159,7 @@ export async function processBatchImage(job: BatchStageJob): Promise<void> {
                     status: ImageStatus.FAILED,
                 },
             });
-            throw new Error(`All ${VARIATIONS_PER_IMAGE} variations failed for image ${imageId}`);
+            throw new Error(`All ${VARIATIONS_PER_IMAGE} variants failed for image ${imageId}`);
         }
 
         await prisma.image.update({

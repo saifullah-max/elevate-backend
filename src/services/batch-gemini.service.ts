@@ -11,6 +11,9 @@ import {
 
 const BATCH_POLL_INTERVAL_MS = Number(process.env.GEMINI_BATCH_POLL_INTERVAL_MS || "5000");
 const BATCH_MAX_WAIT_MS = Number(process.env.GEMINI_BATCH_MAX_WAIT_MS || "120000");
+const GEMINI_BATCH_IMAGE_MODEL = String(
+  process.env.GEMINI_BATCH_IMAGE_MODEL || "gemini-2.5-flash-image"
+).trim();
 
 type BatchRequestLine = {
   key: string;
@@ -81,7 +84,7 @@ export class BatchGeminiService {
 
     if (canUseInline) {
       const inlineBatchJob = await this.client.batches.create({
-        model: "gemini-3-pro-image-preview",
+        model: GEMINI_BATCH_IMAGE_MODEL,
         src: inlineRequests,
         config: {
           display_name: `staging-inline-${Date.now()}`,
@@ -117,7 +120,7 @@ export class BatchGeminiService {
       } as any);
 
       const batchJob = await this.client.batches.create({
-        model: "gemini-3-pro-image-preview",
+        model: GEMINI_BATCH_IMAGE_MODEL,
         src: uploadedFile.name,
         config: {
           display_name: `staging-${Date.now()}`,

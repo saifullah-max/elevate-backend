@@ -85,19 +85,12 @@ app.listen(PORT, async () => {
     console.error('Failed to process subscription renewals on startup:', err);
   }
 
-  // Schedule subscription renewal processing daily at 1 AM UTC
-  // // Using 24 hours interval for simplicity (runs approximately at same time daily)
-  // setInterval(() => {
-  //   processSubscriptionRenewals().catch(err => {
-  //     console.error('Scheduled subscription renewal processing failed:', err);
-  //   });
-  // }, 24 * 60 * 60 * 1000); // 24 hours
-
+  // Schedule subscription renewal processing once per day
   setInterval(() => {
     processSubscriptionRenewals().catch(err => {
       console.error('Scheduled subscription renewal processing failed:', err);
     });
-  }, 1 * 60 * 1000); // 1 minute
+  }, 24 * 60 * 60 * 1000); // 24 hours
 
   // Process pending purchases on startup
   try {

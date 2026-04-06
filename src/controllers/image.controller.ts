@@ -3,6 +3,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { geminiService } from "../services/gemini.service";
+import { fallbackImageService } from "../services/fallbackImage.service";
+import { FALLBACK_VARIANT_COUNT } from "../config/fallback.config";
 import { supabaseStorage } from "../services/supabaseStorage.service";
 import { loggingService } from "../services/logging.service";
 import { logger } from "../utils/logger";
@@ -27,6 +29,7 @@ import {
   linkGuestToUser,
   resolveDemoFingerprint
 } from "../utils/demoTracking";
+import { createSingleImageTrace, getRelativeTracePath, SingleImageTrace } from "../utils/singleImageTrace";
 
 // TypeScript: declare global property for demo upload counts
 declare global {
@@ -787,12 +790,15 @@ export async function generateImage(req: Request, res: Response): Promise<void> 
 
     // ============================================
     // AI PROCESSING: Stage the image
-    // (Retry logic with fallback models handled by geminiService)
+    // Staging via Gemini (see gemini.service)
     // Optimized: Returns Buffer directly, no disk write
     // ============================================
     // MULTI-VARIATION AI GENERATION
     // SSE streaming response
-    const NUM_VARIATIONS = 5;
+    const NUM_VARIATIONS = Math.max(
+      1,
+      Math.min(Number(process.env.STAGE_STREAM_VARIATIONS || "1"), 50)
+    );
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -1005,6 +1011,445 @@ export async function analyzeImage(req: Request, res: Response): Promise<void> {
   }
 }
 
+/**
+ * OPTIMIZED DUAL-MODEL FLOW:
+ * 1. Generate 1 high-quality image with Gemini (shown immediately)
+ * 2. Generate 4 styled variants with fallback model in parallel
+ * 3. Stream each variant as it completes
+ * Reduces API costs while providing variant options to user
+ */
+export async function stageSingleImageWithFallback(req: Request, res: Response): Promise<void> {
+  let userId: string | null = null;
+  let teamId: string | null = req.body.teamId || null;
+  let projectId: string | null = req.body.projectId || null;
+  let teamMembership: any = null;
+  let isTeamOwner = false;
+
+  if (req.user && req.user.id) {
+    userId = req.user.id;
+    const verifyRole = await prisma.user_roles.findFirst({
+      where: { user_id: userId },
+      include: { role: true }
+    });
+    const isAdmin = verifyRole?.role.name === "ADMIN";
+    if (!isAdmin && teamId && teamId !== 'undefined' && teamId !== 'null' && teamId.trim() !== '') {
+      const team = await prisma.teams.findFirst({
+        where: { id: teamId, owner_id: userId, deleted_at: null }
+      });
+      isTeamOwner = !!team;
+      if (!isTeamOwner) {
+        teamMembership = await prisma.team_membership.findUnique({
+          where: { team_id_user_id: { team_id: teamId, user_id: userId } },
+          include: { team: true }
+        });
+      }
+    }
+  } else {
+    teamId = null;
+    projectId = null;
+  }
+
+  let inputImagePath: string | null = null;
+  let isDemo = !userId;
+  let hasPurchasedCredits = false;
+  let unifiedCount = 0;
+  let stagingTrace: SingleImageTrace | null = null;
+
+  if (userId) {
+    const personalCredits = await prisma.user_credit_balance.findUnique({
+      where: { user_id: userId }
+    });
+    const hasPersonalCredits = personalCredits && personalCredits.balance > 0;
+    const purchaseCount = await prisma.user_credit_purchase.count({
+      where: { user_id: userId, status: 'completed' }
+    });
+    hasPurchasedCredits = purchaseCount > 0;
+    if (!hasPersonalCredits && !hasPurchasedCredits) {
+      isDemo = true;
+    } else {
+      isDemo = false;
+    }
+  }
+
+  try {
+    stagingTrace = await createSingleImageTrace({
+      endpoint: req.originalUrl,
+      method: req.method,
+      userId,
+      teamId,
+      projectId,
+      hasFile: !!req.file,
+      fileName: req.file?.originalname || null,
+      contentType: req.file?.mimetype || null,
+      fileSizeBytes: req.file?.size || null,
+      isDemo,
+      fallbackModel: process.env.FALLBACK_IMAGE_MODEL || "replicate",
+      fallbackPrimaryModel: process.env.REPLICATE_FALLBACK_PRIMARY_MODEL || process.env.FALLBACK_PRIMARY_MODEL || null,
+      fallbackBackupModel: process.env.REPLICATE_FALLBACK_BACKUP_MODEL || process.env.FALLBACK_BACKUP_MODEL || null,
+      fallbackRateLimitPerMinute: Number(process.env.FALLBACK_RATE_LIMIT_PER_MINUTE || "20"),
+      fallbackVariantConcurrency: Number(process.env.FALLBACK_VARIANT_CONCURRENCY || "1"),
+      fallbackVariantCount: Number(process.env.FALLBACK_VARIANT_COUNT || "4"),
+    });
+    await stagingTrace.append("request.start", {
+      query: req.query,
+      headers: {
+        accept: req.headers.accept,
+        userAgent: req.headers["user-agent"],
+        xForwardedFor: req.headers["x-forwarded-for"],
+      },
+    });
+
+    if (!req.file) {
+      await stagingTrace.append("request.validation.error", {
+        reason: "No file provided",
+      });
+      res.status(400).json({
+        success: false,
+        error: { code: ImageErrorCode.NO_FILE_PROVIDED, message: ErrorMessages[ImageErrorCode.NO_FILE_PROVIDED] }
+      });
+      return;
+    }
+
+    inputImagePath = req.file.path;
+    const stats = fs.statSync(inputImagePath);
+    const maxSize = 10 * 1024 * 1024;
+    if (stats.size > maxSize) {
+      await stagingTrace.append("request.validation.error", {
+        reason: "File too large",
+        fileSizeBytes: stats.size,
+        maxSizeBytes: maxSize,
+      });
+      fs.unlinkSync(inputImagePath);
+      res.status(400).json({
+        success: false,
+        error: { code: ImageErrorCode.FILE_TOO_LARGE, message: ErrorMessages[ImageErrorCode.FILE_TOO_LARGE] }
+      });
+      return;
+    }
+
+    const { prompt, roomType = "living-room", stagingStyle = "modern" } = req.body;
+    await stagingTrace.append("request.parsed", {
+      roomType,
+      stagingStyle,
+      promptLength: typeof prompt === "string" ? prompt.length : 0,
+    });
+
+    if (!VALID_ROOM_TYPES.includes(roomType.toLowerCase())) {
+      await stagingTrace.append("request.validation.error", {
+        reason: "Invalid room type",
+        roomType,
+      });
+      res.status(400).json({
+        success: false,
+        error: { code: ImageErrorCode.INVALID_ROOM_TYPE, message: ErrorMessages[ImageErrorCode.INVALID_ROOM_TYPE] }
+      });
+      return;
+    }
+
+    if (!VALID_STAGING_STYLES.includes(stagingStyle.toLowerCase())) {
+      await stagingTrace.append("request.validation.error", {
+        reason: "Invalid staging style",
+        stagingStyle,
+      });
+      res.status(400).json({
+        success: false,
+        error: { code: ImageErrorCode.INVALID_STAGING_STYLE, message: ErrorMessages[ImageErrorCode.INVALID_STAGING_STYLE] }
+      });
+      return;
+    }
+
+    logger(`[DUAL_MODEL] stageSingleImageWithFallback START | roomType=${roomType} | style=${stagingStyle} | userId=${userId || 'guest'} | isDemo=${isDemo}`);
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders && res.flushHeaders();
+    const tracePath = stagingTrace ? getRelativeTracePath(stagingTrace.filePath) : null;
+    if (stagingTrace) {
+      await stagingTrace.append("sse.trace.info", {
+        traceId: stagingTrace.traceId,
+        tracePath,
+      });
+    }
+    res.write(`event: trace\ndata: ${JSON.stringify({ traceId: stagingTrace?.traceId || null, tracePath })}\n\n`);
+
+    // Upload original
+    let originalUrl: string | null = null;
+    try {
+      originalUrl = await supabaseStorage.uploadOriginal(inputImagePath);
+      logger(`[DUAL_MODEL] Original uploaded: ${originalUrl}`);
+      await stagingTrace?.append("storage.original.upload.success", {
+        originalUrl,
+      });
+    } catch (err) {
+      await stagingTrace?.append("storage.original.upload.error", {
+        error: String(err),
+      });
+      res.write(`event: error\ndata: ${JSON.stringify({ message: 'Failed to upload original image' })}\n\n`);
+      res.end();
+      return;
+    }
+
+    // ===== PHASE 1: Generate 1 PRIMARY IMAGE with Gemini =====
+    let primaryImageBuffer: Buffer | null = null;
+    const primaryStartTime = Date.now();
+    try {
+      logger(`[DUAL_MODEL] PHASE1_START Gemini primary image generation`);
+      await stagingTrace?.append("phase1.gemini.start", {
+        roomType: roomType.toLowerCase(),
+        stagingStyle: stagingStyle.toLowerCase(),
+      });
+      primaryImageBuffer = await geminiService.stageImage(
+        inputImagePath,
+        roomType.toLowerCase(),
+        stagingStyle.toLowerCase(),
+        prompt
+      );
+      const primaryDuration = Date.now() - primaryStartTime;
+
+      let watermarked = primaryImageBuffer;
+      if (isDemo && primaryImageBuffer) {
+        watermarked = await addWatermark(primaryImageBuffer, "DEMO PREVIEW");
+      }
+
+      const primaryFileName = `staged-primary-${Date.now()}.png`;
+      const primaryUrl = await supabaseStorage.uploadStagedFromBuffer(
+        watermarked,
+        primaryFileName,
+        "image/png"
+      );
+
+      const primaryRecord = await prisma.image.create({
+        data: {
+          user_id: userId,
+          project_id: projectId,
+          original_image_url: originalUrl || '',
+          staged_image_url: primaryUrl,
+          watermarked_preview_url: isDemo ? primaryUrl : null,
+          status: 'COMPLETED',
+          is_demo: isDemo,
+          room_type: roomType,
+          staging_style: stagingStyle,
+          prompt: prompt || null,
+          source: isDemo ? 'demo' : 'user',
+        }
+      });
+
+      logger(`[DUAL_MODEL] PHASE1_COMPLETE Gemini primary image | durationMs=${primaryDuration} | sizeBytes=${primaryImageBuffer.length} | model=GEMINI`);
+      await stagingTrace?.append("phase1.gemini.success", {
+        durationMs: primaryDuration,
+        imageBytes: primaryImageBuffer.length,
+        primaryUrl,
+      });
+      res.write(`event: image\ndata: ${JSON.stringify({
+        stagedImageUrl: primaryUrl,
+        stagedId: primaryFileName,
+        imageId: primaryRecord.id,
+        index: 0,
+        isDemo,
+        roomType,
+        stagingStyle,
+        prompt: prompt || null,
+        isPrimary: true,
+        model: 'GEMINI_3_PRO_IMAGE_PREVIEW',
+        durationMs: primaryDuration,
+        storage: "supabase",
+        demoCount: isDemo ? unifiedCount : undefined,
+        demoLimit: isDemo ? DEMO_LIMIT : undefined,
+      })}\n\n`);
+    } catch (err) {
+      logger(`[DUAL_MODEL] PHASE1_ERROR Gemini primary image failed: ${err}`);
+      await stagingTrace?.append("phase1.gemini.error", {
+        error: String(err),
+      });
+      res.write(`event: error\ndata: ${JSON.stringify({ message: 'Failed to generate primary image', error: String(err) })}\n\n`);
+      res.end();
+      return;
+    }
+
+    // ===== PHASE 2: Generate 4 VARIANTS with Fallback Model (parallel) =====
+    if (primaryImageBuffer && primaryImageBuffer.length > 0) {
+      let responseClosed = false;
+      const handleResponseError = () => {
+        responseClosed = true;
+      };
+      res.on('error', handleResponseError);
+      res.on('close', handleResponseError);
+
+      (async () => {
+        try {
+          const variantsStartTime = Date.now();
+          logger(`[DUAL_MODEL] PHASE2_START parallel variant generation with fallback model=${process.env.FALLBACK_IMAGE_MODEL || 'replicate'}`);
+          let streamedVariantCount = 0;
+          const variants = await fallbackImageService.generateStyledVariants(
+            inputImagePath,
+            primaryImageBuffer,
+            roomType.toLowerCase(),
+            stagingStyle.toLowerCase(),
+            prompt,
+            async (step, details) => {
+              await stagingTrace?.append(step, details || {});
+            },
+            async ({ index, variantId, modelSlug, buffer }) => {
+              if (responseClosed) return;
+
+              try {
+                let watermarked = buffer;
+                if (isDemo) {
+                  watermarked = await addWatermark(buffer, "DEMO PREVIEW");
+                }
+
+                const variantFileName = `staged-variant-${Date.now()}-${index + 1}.png`;
+                const variantUrl = await supabaseStorage.uploadStagedFromBuffer(
+                  watermarked,
+                  variantFileName,
+                  "image/png"
+                );
+
+                await prisma.image.create({
+                  data: {
+                    user_id: userId,
+                    project_id: projectId,
+                    original_image_url: originalUrl || '',
+                    staged_image_url: variantUrl,
+                    watermarked_preview_url: isDemo ? variantUrl : null,
+                    status: 'COMPLETED',
+                    is_demo: isDemo,
+                    room_type: roomType,
+                    staging_style: stagingStyle,
+                    prompt: prompt || null,
+                    source: isDemo ? 'demo' : 'user',
+                  }
+                });
+
+                streamedVariantCount++;
+                logger(`[DUAL_MODEL] VARIANT_${index + 1}_STREAMED model=${modelSlug} | sizeBytes=${buffer.length}`);
+                await stagingTrace?.append("phase2.variant.streamed", {
+                  index: index + 1,
+                  bytes: buffer.length,
+                  variantUrl,
+                  modelSlug,
+                  variantId,
+                });
+
+                if (!responseClosed) {
+                  res.write(`event: image\ndata: ${JSON.stringify({
+                    stagedImageUrl: variantUrl,
+                    stagedId: variantFileName,
+                    index: index + 1,
+                    isDemo,
+                    roomType,
+                    stagingStyle,
+                    prompt: prompt || null,
+                    isVariant: true,
+                    model: modelSlug,
+                    storage: "supabase",
+                  })}\n\n`);
+                }
+              } catch (err) {
+                logger(`[DUAL_MODEL] VARIANT_${index + 1}_ERROR upload failed: ${err}`);
+                await stagingTrace?.append("phase2.variant.upload.error", {
+                  index: index + 1,
+                  error: String(err),
+                  modelSlug,
+                  variantId,
+                });
+              }
+            }
+          );
+          const variantsDuration = Date.now() - variantsStartTime;
+
+          logger(`[DUAL_MODEL] PHASE2_SUCCESS generated ${variants.length}/${FALLBACK_VARIANT_COUNT} variants | streamed=${streamedVariantCount} | totalDurationMs=${variantsDuration}`);
+          await stagingTrace?.append("phase2.fallback.success", {
+            generatedVariants: variants.length,
+            streamedVariants: streamedVariantCount,
+            durationMs: variantsDuration,
+          });
+
+          logger(`[DUAL_MODEL] PHASE2_COMPLETE all variants processed`);
+          await stagingTrace?.append("phase2.complete", {
+            responseClosed,
+            totalVariantsProcessed: variants.length,
+          });
+          if (!responseClosed) {
+            res.write(`event: complete\ndata: ${JSON.stringify({ status: 'all_variants_completed', totalVariants: variants.length })}\n\n`);
+            res.end();
+          }
+        } catch (err) {
+          logger(`[DUAL_MODEL] PHASE2_ERROR variant generation error: ${err}`);
+          await stagingTrace?.append("phase2.error", {
+            error: String(err),
+          });
+          if (!responseClosed) {
+            res.write(`event: variant_error\ndata: ${JSON.stringify({ message: 'Variant generation encountered an error', error: String(err) })}\n\n`);
+            res.end();
+          }
+        }
+      })();
+    } else {
+      logger(`[DUAL_MODEL] PHASE2_SKIPPED no primary image buffer`);
+      await stagingTrace?.append("phase2.skipped", {
+        reason: "No primary image buffer",
+      });
+      res.write(`event: complete\ndata: ${JSON.stringify({ status: 'primary_only' })}\n\n`);
+      res.end();
+    }
+
+    // Deduct 1 credit for the primary image
+    if (userId && teamId) {
+      try {
+        if (isTeamOwner) {
+          await prisma.teams.update({
+            where: { id: teamId },
+            data: { wallet: { decrement: 1 } }
+          });
+        } else if (teamMembership) {
+          await prisma.team_membership.update({
+            where: { id: teamMembership.id },
+            data: { used: { increment: 1 } }
+          });
+          await prisma.team_usage.create({
+            data: {
+              membership_id: teamMembership.id,
+              image_id: originalUrl || 'unknown',
+              credits_used: 1,
+              teamsId: teamId,
+            }
+          });
+        }
+      } catch (err) {
+        logger(`[DUAL_MODEL] Failed to deduct credits: ${err}`);
+      }
+    }
+  } catch (err) {
+    logger(`[DUAL_MODEL] Unexpected error: ${err}`);
+    await stagingTrace?.append("request.unhandled.error", {
+      error: String(err),
+    });
+    res.status(500).json({
+      success: false,
+      error: { code: ImageErrorCode.UNKNOWN_ERROR, message: ErrorMessages[ImageErrorCode.UNKNOWN_ERROR] }
+    });
+  } finally {
+    await stagingTrace?.append("request.finally", {
+      tempFileExists: !!(inputImagePath && fs.existsSync(inputImagePath)),
+    });
+    if (inputImagePath && fs.existsSync(inputImagePath)) {
+      try {
+        fs.unlinkSync(inputImagePath);
+        await stagingTrace?.append("cleanup.tempfile.deleted", {
+          path: inputImagePath,
+        });
+      } catch (e) {
+        logger(`Failed to clean up temp file: ${e}`);
+        await stagingTrace?.append("cleanup.tempfile.error", {
+          error: String(e),
+        });
+      }
+    }
+  }
+}
+
 export async function generateMultipleImages(
   req: Request,
   res: Response
@@ -1025,7 +1470,7 @@ export async function generateMultipleImages(
     return;
   }
 
-  const VARIATIONS_PER_IMAGE = 5;
+  const VARIATIONS_PER_IMAGE = 3;
   const wantsStream =
     req.query.stream === "1" ||
     (typeof req.headers.accept === "string" && req.headers.accept.includes("text/event-stream"));

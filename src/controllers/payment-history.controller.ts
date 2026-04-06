@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import prisma from "../dbConnection";
+import InvoiceService from "../services/invoice.service";
 
 /**
  * Payment History Controller
@@ -193,10 +194,6 @@ export class PaymentHistoryController {
                     error: "You do not have access to this invoice",
                 });
             }
-
-            // Import invoice service
-            const InvoiceService = (await import("../services/invoice.service"))
-                .default;
 
             const invoiceData = {
                 invoiceId: `INV-${subscription.id}`,
